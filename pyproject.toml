@@ -1,0 +1,84 @@
+[project]
+name = "ready2go-ai-service"
+version = "0.1.0"
+description = "Ready2Go AI Continuity Service — vector-backed integrity scoring + bounded continuity-audit summaries."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "Serve Tech Global" }]
+
+dependencies = [
+    # Web / API
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-multipart>=0.0.12",
+    # HTTP / resilience
+    "httpx>=0.27",
+    "tenacity>=9.0",
+    # AI / vectors
+    "openai>=1.54",
+    "weaviate-client>=4.9",
+    "tiktoken>=0.8",
+    # Relational state
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.14",
+    # MongoDB + Cloudinary — offline prep/seed scripts only (scripts/prep/*)
+    "pymongo>=4.9",
+    "cloudinary>=1.41",
+    # Document extraction
+    "pypdf>=5.1",
+    "pdfplumber>=0.11",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    # Logging
+    "structlog>=24.4",
+]
+
+[project.scripts]
+# Enables: `uv run main`
+main = "app.main:run"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# ----------------------------------------------------------------------------
+# Tooling
+# ----------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["B008"]  # FastAPI uses function calls (Depends/Header) in defaults
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+warn_unused_configs = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+files = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q"
