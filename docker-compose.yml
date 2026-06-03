@@ -1,5 +1,7 @@
-# Local development stack: the API + its two backing stores.
-# Weaviate Cloud (WCD) is used in real environments; this local Weaviate is for dev.
+# Local development stack: the API + its two backing stores (Weaviate + MongoDB).
+# Both are self-hosted/open-source here for dev; production points at managed
+# equivalents via .env. Python keeps its own `ai_*` collections inside the same
+# MongoDB database as the app (default "ready2go"); no separate state DB.
 
 services:
   api:
@@ -9,26 +11,24 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://r2g:r2g@postgres:5432/r2g_ai
+      # Local dev defaults (override via .env for staging/prod).
+      MONGODB_URI: mongodb://mongo:27017
+      MONGODB_DB: ready2go
       WEAVIATE_URL: http://weaviate:8080
     depends_on:
-      postgres:
+      mongo:
         condition: service_healthy
       weaviate:
         condition: service_started
 
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: r2g
-      POSTGRES_PASSWORD: r2g
-      POSTGRES_DB: r2g_ai
+  mongo:
+    image: mongo:7
     ports:
-      - "5432:5432"
+      - "27017:27017"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mongo_data:/data/db
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U r2g -d r2g_ai"]
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -48,5 +48,5 @@ services:
       - weaviate_data:/var/lib/weaviate
 
 volumes:
-  pgdata:
+  mongo_data:
   weaviate_data:

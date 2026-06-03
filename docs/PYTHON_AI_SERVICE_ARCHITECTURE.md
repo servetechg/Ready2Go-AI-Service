@@ -57,7 +57,7 @@ A separate, independently-deployable Python service that:
 | Decision | Choice |
 |---|---|
 | **Transport / writeback** | **REST, synchronous.** Python returns JSON `{status, score, summary}`; **Next.js keeps writing MongoDB** (existing `EmergencyPlan.updateOne` / `ContinuityAudit.findOneAndUpdate`). Lowest blast radius; Python never touches the app's Mongo. |
-| **Vector DB** | **Weaviate** (Weaviate Cloud / WCD managed). Chosen for native multi-tenancy + hybrid (BM25 + vector) search. |
+| **Vector DB** | **Weaviate — self-hosted, open-source** (containerized via `docker-compose.yml`; not WCD managed). Chosen for native multi-tenancy + hybrid (BM25 + vector) search. |
 | **Embeddings / LLM** | **OpenAI** — `text-embedding-3-small` for vectors, `gpt-4o-mini` for summaries. Reuses existing `OPENAI_API_KEY`. |
 | **Hosting** | **Managed PaaS** (Render / Railway / Fly.io) — container reachable from Vercel by URL. |
 
@@ -87,16 +87,17 @@ A separate, independently-deployable Python service that:
  │  HTTPS  ─────────┼────▶│        ▲             │              │         │
  │  POST /v1/       │ JSON│        │             ▼              ▼         │
  │   integrity/     │◀────┼────────┘      ┌────────────┐  ┌────────────┐  │
- │   analyze        │     │               │  Postgres  │  │  Summary / │  │
- │       │          │     │               │  (state,   │  │  audit gen │  │
+ │   analyze        │     │               │  MongoDB   │  │  Summary / │  │
+ │       │          │     │               │  (ai_*     │  │  audit gen │  │
  │       ▼          │     │               │  cache,    │  └────────────┘  │
- │ EmergencyPlan.   │     │               │  logs)     │                  │
- │  updateOne(...)  │     │               └────────────┘                  │
- └──────────────────┘     └───────────────────────────────────────────────┘
-        │                                  ▲   ▲
-        ▼                                  │   │  fetch file bytes
-   MongoDB Atlas                    Cloudinary  (secure_url from payload)
- (Next.js owns writes)             (earthquick/emergency-plans)
+ │ EmergencyPlan.   │     │               │  state,    │                  │
+ │  updateOne(...)  │     │               │  logs)     │                  │
+ └──────────────────┘     │               └────────────┘                  │
+        │                 └───────────────────────────────────────────────┘
+        ▼                                  ▲   ▲
+   MongoDB Atlas — app DB           Cloudinary  (secure_url from payload)
+ (`ready2go`; Next.js owns writes) (earthquick/emergency-plans)
+ Python's state lives in `ai_*` collections in the SAME `ready2go` DB — never the app's domain docs.
 ```
 
 **Key flows**
@@ -130,9 +131,9 @@ still pass `extractedText` as a fast-path hint, but Python is authoritative.)
 | Validation | **Pydantic v2** | request/response contracts |
 | HTTP client | **httpx** (async) | Cloudinary download, OpenAI |
 | Retries | **tenacity** | exp backoff + jitter on OpenAI/Weaviate |
-| Vector DB client | **weaviate-client v4** | WCD managed |
+| Vector DB client | **weaviate-client v4** | self-hosted OSS Weaviate (docker-compose) |
 | Embeddings/LLM | **openai** SDK | `text-embedding-3-small`, `gpt-4o-mini` |
-| Relational state | **Postgres** (managed add-on) + **SQLAlchemy 2 / psycopg** | dedup cache, aggregate state, call logs |
+| Python-owned state | **MongoDB** (`ai_*` collections in the same `ready2go` DB) + **pymongo** | dedup cache, aggregate state, call logs — its own collections, not the app's domain docs |
 | Extraction | **pypdf**/**pdfplumber** (PDF), **python-docx** (DOCX), **openpyxl** (XLSX), stdlib `csv` | mirror Next.js coverage; OCR is a v2 option |
 | Tokenizer | **tiktoken** | token budgeting for chunks & prompts |
 | Logging | **structlog** | JSON structured logs |
@@ -167,7 +168,7 @@ r2g-continuity-ai/
 │   │   ├── per_doc.py          # ≤280-char one-liner gen
 │   │   └── audit.py            # incremental state + bounded map-reduce
 │   ├── store/
-│   │   ├── models.py           # SQLAlchemy tables
+│   │   ├── models.py           # Mongo ai_* collection helpers + index bootstrap (ready2go DB)
 │   │   ├── cache.py            # content-hash dedup cache
 │   │   ├── aggregate.py        # rolling audit state
 │   │   └── calllog.py          # AI call audit trail
@@ -176,9 +177,8 @@ r2g-continuity-ai/
 │   │   └── client.py           # chat completions + retry + token meter
 │   └── schemas.py              # Pydantic request/response models
 ├── tests/
-├── migrations/                 # alembic
 ├── Dockerfile
-├── docker-compose.yml          # local: app + postgres + weaviate
+├── docker-compose.yml          # local: app + weaviate
 ├── pyproject.toml
 └── README.md
 ```
@@ -210,16 +210,25 @@ versioned.
 > Tenancy lets us delete/replace all chunks for an attachment with a single
 > tenant-scoped filtered delete, and keeps cross-tenant data isolated.
 
-### 4.2 Postgres (Python-owned state — Next.js never reads it)
+### 4.2 MongoDB — Python-owned state (`ai_*` collections in the app's `ready2go` DB)
 
-| Table | Key columns | Purpose |
+Python's own collections, **not** the app's domain docs. Next.js never reads
+them; Python writes them on the request path. They live in the **same** `ready2go`
+database (no separate DB) and are name-prefixed `ai_` so they never collide with
+`continuityplans` / `continuityauditreports`. Field types are BSON (JSON-native),
+so the old `jsonb` columns become embedded sub-documents.
+
+| Collection | Key fields | Purpose |
 |---|---|---|
-| `analysis_cache` | `attachment_id`, `content_hash`, `model_version`, `status`, `score`, `summary`, `score_components(jsonb)`, `vector_ids(jsonb)`, `analyzed_at` | **dedup cache** — if `(content_hash, model_version)` unchanged → return cached verdict, skip embeddings + LLM. Headline cost lever. |
-| `audit_state` | `tenant_key` (pk), `counts(jsonb)`, `integrity(jsonb)`, `score_sum`, `score_count`, `notable(jsonb)`, `dirty(bool)`, `updated_at` | **incremental aggregate** — O(1) update per analyze; powers bounded summaries without corpus reprocessing |
-| `ai_call_log` | `id`, `ts`, `kind`, `attachment_id`, `model`, `prompt_tokens`, `completion_tokens`, `latency_ms`, `success`, `error` | observability / cost audit trail (fixes weakness #10) |
+| `ai_analysis_cache` | `attachmentId`, `contentHash`, `modelVersion`, `status`, `score`, `summary`, `scoreComponents{}`, `vectorIds[]`, `analyzedAt`; **unique index `(contentHash, modelVersion)`** | **dedup cache** — if `(contentHash, modelVersion)` unchanged → return cached verdict, skip embeddings + LLM. Headline cost lever. |
+| `ai_audit_state` | `tenantKey` (`_id`), `counts{}`, `integrity{}`, `scoreSum`, `scoreCount`, `notable[]`, `dirty(bool)`, `updatedAt` | **incremental aggregate** — O(1) update per analyze; powers bounded summaries without corpus reprocessing |
+| `ai_call_log` | `ts`, `kind`, `attachmentId`, `model`, `promptTokens`, `completionTokens`, `latencyMs`, `success`, `error` | observability / cost audit trail (fixes weakness #10) |
 
-> Postgres + Weaviate are two managed add-ons. We *could* collapse state into
-> Weaviate later; kept separate for clean relational queries on cache/logs.
+> Only **two** stores: Weaviate (vectors) + MongoDB (`ai_*` collections in
+> `ready2go`). No Postgres. The `tenantKey` on `ai_audit_state` (and on every
+> query that scopes cache/logs) enforces tenant isolation; index
+> `(contentHash, modelVersion)`
+> on `ai_analysis_cache` drives the dedup short-circuit.
 
 ---
 
@@ -267,7 +276,7 @@ cache unless `force`). Drives historical backfill (PROJECT_CONTEXT §11.5).
 
 ### 5.4 `GET /healthz` / `GET /readyz`
 
-Liveness + dependency readiness (Weaviate, Postgres, OpenAI reachable).
+Liveness + dependency readiness (Weaviate, MongoDB `ready2go`, OpenAI reachable).
 
 ---
 
@@ -311,8 +320,9 @@ break the tie. Most documents never trigger it → cost stays low.
 
 ### 7.1 Per-document one-liner
 
-Generated once per `(contentHash, modelVersion)` and **persisted** (Postgres
-cache + written to Mongo `aiIntegritySummary` by Next.js). ≤280 chars, grounded
+Generated once per `(contentHash, modelVersion)` and **persisted** (the
+`ai_analysis_cache` collection in `ready2go` + written to the app's
+`aiIntegritySummary` field by Next.js). ≤280 chars, grounded
 in the top chunks + composite signals. Re-upload of identical bytes ⇒ cache hit,
 **zero** new tokens.
 
@@ -389,14 +399,15 @@ The core fix. The audit narrative is **not** "one appended line per document".
 
 - Shared-secret bearer + optional HMAC body signature on all `/v1` routes.
 - Tenant isolation enforced at the Weaviate tenant boundary and on every
-  Postgres query (`tenant_key`).
-- OpenAI/Weaviate/Cloudinary creds via env only; no secrets in code.
+  MongoDB `ai_*` query (`tenantKey`).
+- OpenAI/Weaviate/Cloudinary/MongoDB creds via env only; no secrets in code.
 
 ### 8.6 Config / env vars (`app/config.py`)
 
 `OPENAI_API_KEY`, `OPENAI_EMBED_MODEL`(=text-embedding-3-small),
 `OPENAI_SUMMARY_MODEL`(=gpt-4o-mini), `WEAVIATE_URL`, `WEAVIATE_API_KEY`,
-`DATABASE_URL`(Postgres), `PYTHON_INTEGRITY_TOKEN`, `HMAC_SECRET`,
+`MONGODB_URI` + `MONGODB_DB`(=`ready2go`; Python's `ai_*` state collections live here),
+`PYTHON_INTEGRITY_TOKEN`, `HMAC_SECRET`,
 `MODEL_VERSION`, scoring weights + thresholds, `MAX_CHUNKS_PER_DOC`,
 `AUDIT_SAMPLE_CAP`, `LLM_JUDGE_BAND`, `REQUEST_TIMEOUT_S`.
 
@@ -443,7 +454,7 @@ Each milestone is independently shippable and testable. Stop/adjust between any.
 
 | # | Module | Outcome | Acceptance |
 |---|---|---|---|
-| **M0** | **Skeleton & infra** — FastAPI app, config, auth, Docker, `/healthz`, deploy to PaaS, provision WCD + Postgres | Service is live and authenticated | `GET /healthz` 200 from Vercel egress; auth rejects bad token |
+| **M0** | **Skeleton & infra** — FastAPI app, config, auth, Docker, `/healthz`, deploy to PaaS, provision self-hosted Weaviate + MongoDB (`ai_*` collections in `ready2go`) | Service is live and authenticated | `GET /healthz` 200 from Vercel egress; auth rejects bad token |
 | **M1** | **Ingestion & extraction** — Cloudinary fetch, hash, pdf/docx/xlsx/csv extraction + quality meta, token-aware chunking | Any allowed file → clean chunks + extraction-quality score | Golden-file tests for each type incl. scan-only/empty |
 | **M2** | **Vectors** — Weaviate collections, multi-tenancy, batched embeddings, upsert, hybrid search, category prototypes seed | Doc chunks embedded + searchable per tenant | Upsert+query round-trip; tenant isolation test |
 | **M3** | **Integrity scorer** — the 5 signals + composite + banding + overrides + optional gated LLM judge | `POST /v1/integrity/analyze` returns valid contract JSON | Contract tests (status/score/summary bounds); component scores explainable |
@@ -476,14 +487,16 @@ Each milestone is independently shippable and testable. Stop/adjust between any.
 
 ## 12. Open items to confirm as we build (non-blocking)
 
-1. **Tenant key** — `licenseId` vs `city|state|country`? (default: `licenseId`,
-   fallback to location triple). Affects Weaviate tenant granularity.
+1. **Tenant key** — ✅ RESOLVED: `tenantKey = "sub_" + ownerUserId` (per the
+   implemented Next.js tenancy alignment); used as the Weaviate tenant name and
+   the `ai_*` collections' scoping key.
 2. **OCR for scan-only PDFs** — v2 (e.g. Tesseract / a hosted OCR) or accept the
    low-quality penalty for v1? (default: penalty in v1.)
 3. **Audit regeneration trigger** — UI button only, or also a debounced
    background refresh? (default: button + debounce.)
-4. **Postgres vs single-store** — keep Postgres for state/cache/logs, or fold
-   into Weaviate later? (default: Postgres for v1.)
+4. **State store** — ✅ RESOLVED: **MongoDB only**, as `ai_*` collections inside
+   the app's `ready2go` DB (no separate DB, **no Postgres**). Two stores total:
+   Weaviate (vectors) + MongoDB (state). Next.js owns the app's domain-doc writes.
 5. **`inferCoopPlanMetadata` migration** — keep in Next.js (default) or move to
    Python in a later phase?
 

@@ -44,16 +44,19 @@ class Settings(BaseSettings):
     weaviate_url: str = ""
     weaviate_api_key: str = ""
 
-    # ---- Postgres (state / cache / logs) -------------------------------
-    database_url: str = ""
-
-    # ---- MongoDB (offline prep/seed scripts only — never the request path) ----
-    # Targets the tenant-aware `continuityplans` / `continuityauditreports`
-    # collections. The live FastAPI request path stays Mongo-free (ARCHITECTURE §1.3).
-    # Point MONGODB_URI at a DEV/STAGING cluster. Use a read-only user for
-    # the Phase-B prepare.py; seed_mongo.py (which writes) needs a write user.
+    # ---- MongoDB -------------------------------------------------------
+    # ONE database (`mongodb_db`, default "ready2go"), TWO disjoint uses:
+    #   1. Python's OWN request-path state lives in dedicated `ai_*` COLLECTIONS
+    #      in this same DB: `ai_analysis_cache` / `ai_audit_state` / `ai_call_log`.
+    #      Next.js never reads them; Python never writes the app's domain docs
+    #      (`continuityplans` / `continuityauditreports`) — Next.js owns those
+    #      writes (ARCHITECTURE §4.2).
+    #   2. The offline prep/seed scripts (scripts/prep/*) read/write the app's
+    #      tenant-aware collections; point MONGODB_URI at a DEV/STAGING cluster
+    #      for those.
     mongodb_uri: str = ""
-    mongodb_db: str = "ready2go"  # default DB name — PROJECT_CONTEXT §4
+    # One DB for app docs + Python's ai_* collections (PROJECT_CONTEXT §4).
+    mongodb_db: str = "ready2go"
 
     # ---- Cloudinary (optional — seed upload only) ----------------------
     # Only consulted when SEED_USE_CLOUDINARY=true. Reuses the same Cloudinary

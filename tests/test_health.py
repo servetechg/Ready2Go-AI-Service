@@ -16,7 +16,7 @@ def test_readyz_reports_dependencies(client: TestClient) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert set(body["dependencies"]) == {"openai", "weaviate", "postgres"}
+    assert set(body["dependencies"]) == {"openai", "weaviate", "mongodb"}
 
 
 def test_v1_requires_auth_when_token_configured(monkeypatch) -> None:

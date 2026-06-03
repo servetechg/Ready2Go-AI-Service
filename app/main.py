@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         model_version=settings.model_version,
         embed_model=settings.openai_embed_model,
     )
-    # Future: warm up lazy clients (Weaviate / Postgres / OpenAI) here.
+    # Future: warm up lazy clients (Weaviate / MongoDB / OpenAI) here.
     yield
     log.info("service.shutdown")
 

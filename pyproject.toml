@@ -21,11 +21,9 @@ dependencies = [
     "openai>=1.54",
     "weaviate-client>=4.9",
     "tiktoken>=0.8",
-    # Relational state
-    "sqlalchemy>=2.0",
-    "psycopg[binary]>=3.2",
-    "alembic>=1.14",
-    # MongoDB + Cloudinary — offline prep/seed scripts only (scripts/prep/*)
+    # MongoDB — Python's own ai_* state collections (cache/state/logs) in the
+    # app's ready2go DB AND the offline prep/seed scripts (scripts/prep/*).
+    # Cloudinary is seed-upload only.
     "pymongo>=4.9",
     "cloudinary>=1.41",
     # Document extraction
@@ -35,6 +33,7 @@ dependencies = [
     "openpyxl>=3.1",
     # Logging
     "structlog>=24.4",
+    "numpy>=2.4.6",
 ]
 
 [project.scripts]

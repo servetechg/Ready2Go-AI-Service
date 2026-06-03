@@ -27,7 +27,7 @@ async def readyz() -> dict[str, object]:
     dependencies = {
         "openai": bool(settings.openai_api_key),
         "weaviate": bool(settings.weaviate_url),
-        "postgres": bool(settings.database_url),
+        "mongodb": bool(settings.mongodb_uri),
     }
     return {
         "status": "ok",
