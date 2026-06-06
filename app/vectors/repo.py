@@ -13,7 +13,6 @@ Operations:
   content_centroid     — compute mean vector across all of a doc's chunks.
   sibling_similarities — nearest-neighbour cosine among siblings in same plan
                          (duplication signal).
-  hybrid_name_search   — BM25 + vector search of the filename/slug (name signal).
 """
 
 from __future__ import annotations
@@ -31,8 +30,10 @@ from app.vectors.schema import DOC_CHUNK_COLLECTION
 
 logger = logging.getLogger(__name__)
 
-# Cosine distance that we treat as "basically identical" (duplication flag).
-_DUP_THRESHOLD = 0.05
+# Page size for paginated reads (get_all_chunks). Weaviate returns one page per
+# query; we loop with offset until a short page is returned so the full chunk set
+# is always read regardless of document size.
+_FETCH_PAGE_SIZE = 1000
 
 
 @dataclass
@@ -71,11 +72,16 @@ def upsert_chunks(
     file_name: str,
     content_hash: str,
     model_version: str,
-) -> None:
+) -> list[str]:
     """Delete existing chunks for *attachment_id*, then insert the new ones.
 
     Re-upload = delete-then-insert so there are never stale duplicates.
     Idempotent: safe to call multiple times for the same attachment.
+
+    Returns the Weaviate object UUIDs of the inserted chunks, in chunk order
+    (chunkIndex 0..N-1). The caller stores these in ai_analysis_cache.vectorIds
+    so each cached verdict has a direct reference to its vectors in Weaviate.
+    Empty list if there were no chunks to insert.
     """
     _require_tenant(tenant)
     # Multi-tenancy is enabled on DocChunk — the tenant must be registered
@@ -105,12 +111,16 @@ def upsert_chunks(
             )
         )
 
+    uuids: list[str] = []
     if objects:
-        tenant_col.data.insert_many(objects)  # type: ignore[arg-type]
+        result = tenant_col.data.insert_many(objects)  # type: ignore[arg-type]
+        # result.uuids maps insert-index -> UUID; return them in chunk order.
+        uuids = [str(result.uuids[i]) for i in sorted(result.uuids)]
     logger.debug(
         "weaviate.upsert_chunks tenant=%s attachment=%s count=%d",
         tenant, attachment_id, len(objects),
     )
+    return uuids
 
 
 def delete_by_attachment(tenant: str, attachment_id: str) -> None:
@@ -138,6 +148,11 @@ def get_all_chunks(tenant: str, attachment_id: str) -> list[StoredChunk]:
 
     Used by per-doc summarization — we own the whole document, so there is no
     "most relevant" subset; every chunk is needed.
+
+    Weaviate paginates: fetch_objects returns at most one page. We loop with an
+    increasing offset until a short page is returned, so EVERY chunk is read back
+    no matter how many there are (important now that MAX_CHUNKS_PER_DOC can be 0
+    = unlimited — a single fixed limit would silently drop the tail).
     """
     _require_tenant(tenant)
     client = get_client()
@@ -146,25 +161,33 @@ def get_all_chunks(tenant: str, attachment_id: str) -> list[StoredChunk]:
         return []  # no data for this tenant yet.
     tenant_col = collection.with_tenant(tenant)
 
-    result = tenant_col.query.fetch_objects(
-        filters=wvq.Filter.by_property("attachmentId").equal(attachment_id),
-        include_vector=True,
-        limit=10_000,  # hard ceiling; chunk cap prevents hitting this in practice
-    )
-
-    chunks = []
-    for obj in result.objects:
-        props = obj.properties
-        raw_vec = obj.vector.get("default") if obj.vector else None
-        # The "default" key holds list[float] for unnamed vectors;
-        # cast away the broader type that the SDK exposes for named/multi vectors.
-        vec_val: list[float] | None = raw_vec if isinstance(raw_vec, list) else None  # type: ignore[assignment]
-        chunks.append(StoredChunk(
-            chunk_index=int(props.get("chunkIndex", 0)),  # type: ignore[arg-type]
-            text=str(props.get("text", "")),
-            attachment_id=str(props.get("attachmentId", "")),
-            vector=vec_val,
-        ))
+    filt = wvq.Filter.by_property("attachmentId").equal(attachment_id)
+    chunks: list[StoredChunk] = []
+    offset = 0
+    while True:
+        result = tenant_col.query.fetch_objects(
+            filters=filt,
+            include_vector=True,
+            limit=_FETCH_PAGE_SIZE,
+            offset=offset,
+        )
+        if not result.objects:
+            break
+        for obj in result.objects:
+            props = obj.properties
+            raw_vec = obj.vector.get("default") if obj.vector else None
+            # The "default" key holds list[float] for unnamed vectors;
+            # cast away the broader type the SDK exposes for named/multi vectors.
+            vec_val: list[float] | None = raw_vec if isinstance(raw_vec, list) else None  # type: ignore[assignment]
+            chunks.append(StoredChunk(
+                chunk_index=int(props.get("chunkIndex", 0)),  # type: ignore[arg-type]
+                text=str(props.get("text", "")),
+                attachment_id=str(props.get("attachmentId", "")),
+                vector=vec_val,
+            ))
+        if len(result.objects) < _FETCH_PAGE_SIZE:
+            break  # last (short) page reached
+        offset += _FETCH_PAGE_SIZE
 
     # Return in document order.
     chunks.sort(key=lambda c: c.chunk_index)
@@ -227,53 +250,6 @@ def sibling_similarities(
         dist = obj.metadata.distance if obj.metadata else 1.0
         sims.append(SimilarityResult(attachment_id=aid, distance=dist or 1.0))
     return sims
-
-
-def hybrid_name_search(
-    tenant: str,
-    query: str,
-    query_vector: list[float],
-    limit: int = 5,
-) -> list[SimilarityResult]:
-    """BM25 + vector hybrid search on the fileName field — name-alignment signal.
-
-    The query is typically "<planLabel> <category>" so both keyword matches
-    (exact filename words) and semantic similarity contribute.
-
-    DocChunk is created with Vectorizer.none() (we supply our own OpenAI
-    vectors), so the caller MUST pass *query_vector* — the embedding of *query*.
-    Without it, Weaviate cannot build the dense half of the hybrid query and the
-    call fails, which is exactly how the name signal silently collapsed to 0
-    before this parameter existed.
-
-    Note: no target_vector arg for single (unnamed) vector collections.
-    """
-    _require_tenant(tenant)
-    client = get_client()
-    collection = client.collections.get(DOC_CHUNK_COLLECTION)
-    if not collection.tenants.exists(tenant):
-        return []  # no data to name-search for this tenant yet.
-    tenant_col = collection.with_tenant(tenant)
-
-    result = tenant_col.query.hybrid(
-        query=query,
-        vector=query_vector,  # dense half — required under Vectorizer.none()
-        alpha=0.5,            # 50% BM25, 50% vector
-        limit=limit,
-        return_metadata=wvq.MetadataQuery(score=True),
-        return_properties=["attachmentId", "fileName"],
-    )
-
-    seen: set[str] = set()
-    hits = []
-    for obj in result.objects:
-        aid = str(obj.properties.get("attachmentId", ""))
-        if aid in seen:
-            continue
-        seen.add(aid)
-        score = obj.metadata.score if obj.metadata else 0.0
-        hits.append(SimilarityResult(attachment_id=aid, distance=1.0 - (score or 0.0)))
-    return hits
 
 
 # ---------------------------------------------------------------------------

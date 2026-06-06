@@ -7,8 +7,8 @@ ai_audit_state document shape (one per tenantKey, _id = tenantKey):
     integrity:     {inSync: N, reviewing: N, deviation: N, unanalyzed: N},
     scoreSum:      N,
     scoreCount:    N,
-    notable:       [{fileName, status, score, planId}],  # worst-N (score<60), bounded
-    all_analyzed:  [{fileName, status, score, planId}],  # every doc, no cap/threshold
+    notable:       [{fileName, status, score, planId, summary}],  # worst-N (score<60), bounded
+    all_analyzed:  [{fileName, status, score, planId, summary}],  # every doc, no cap/threshold
     dirty:         bool,  # True when a new analyze happened since last audit
     updatedAt:     datetime,
   }
@@ -34,6 +34,11 @@ from app.store.models import get_state_col
 _NOTABLE_CAP = 20
 # Score threshold below which an item is "notable" (worth flagging in audit).
 _NOTABLE_THRESHOLD = 60
+# Per-item summary excerpt length stored in the rolling state. The FULL summary
+# lives in ai_analysis_cache; here we keep a bounded excerpt so the audit LLM can
+# read what each document is about without risking MongoDB's 16 MB doc-size limit
+# (all_analyzed is uncapped — one entry per analyzed document).
+_AUDIT_SUMMARY_CHARS = 600
 
 
 def update(
@@ -44,12 +49,15 @@ def update(
     score: int,
     file_name: str,
     plan_id: str,
+    summary: str = "",
 ) -> None:
     """O(1) increment of rolling audit state for *tenant_key*.
 
     Increments the appropriate integrity counter, accumulates score sum,
-    and adds to the notable list if score is low.  Marks dirty=True.
+    and records the doc (with a bounded summary excerpt) in all_analyzed — and
+    in the notable list too if the score is low.  Marks dirty=True.
     """
+    summary_excerpt = (summary or "").strip()[:_AUDIT_SUMMARY_CHARS]
     col = get_state_col()
 
     # Map status string -> integrity sub-field name.
@@ -85,6 +93,7 @@ def update(
                 "status":   status,
                 "score":    score,
                 "planId":   plan_id,
+                "summary":  summary_excerpt,
             }
         },
     }
@@ -99,7 +108,8 @@ def update(
                 "$push": {
                     "notable": {
                         "$each": [{"fileName": file_name, "status": status,
-                                   "score": score, "planId": plan_id}],
+                                   "score": score, "planId": plan_id,
+                                   "summary": summary_excerpt}],
                         "$sort": {"score": pymongo.ASCENDING},
                         "$slice": _NOTABLE_CAP,
                     }

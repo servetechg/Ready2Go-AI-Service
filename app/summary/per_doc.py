@@ -1,4 +1,4 @@
-"""Per-document <=1000-char detailed paragraph summary.
+"""Per-document <=2000-char detailed summary (captures all major points).
 
 Approach (D7 — full-document, no retrieval subset):
   - Use the complete chunk set (all of this document's chunks from Weaviate).
@@ -25,8 +25,10 @@ _LogCall = Callable[[dict[str, Any]], None] | None
 # ~4 chars/token, 4000 tokens of context headroom = ~16 000 chars.
 _SINGLE_PASS_CHARS = 16_000
 
-# Characters per group in map-reduce batching.
-_BATCH_CHARS = 6_000
+# Characters per group in map-reduce batching. Larger batch = fewer MAP calls
+# for very large documents (we no longer cap the number of batches, so this is
+# the main lever keeping cost bounded while still covering the whole document).
+_BATCH_CHARS = 12_000
 
 
 async def one_liner(
@@ -37,7 +39,7 @@ async def one_liner(
     plan_category: str,
     log_call: _LogCall = None,
 ) -> str:
-    """Generate a <=1000-char plain-English paragraph summary for this document.
+    """Generate a <=2000-char plain-English summary (all major points) for this document.
 
     Args:
         chunks:        ALL chunks for this attachment (from get_all_chunks).
@@ -47,8 +49,8 @@ async def one_liner(
         log_call:      Optional calllog.append callback.
 
     Returns:
-        <=1000-char plain-English paragraph.  Never empty (falls back to a
-        deterministic description if the LLM fails).
+        <=2000-char plain-English summary covering all major points.  Never empty
+        (falls back to a deterministic description if the LLM fails).
     """
     settings = get_settings()
     if not settings.openai_api_key:
@@ -74,7 +76,7 @@ async def one_liner(
     summary = str(raw).strip()
     if not summary:
         return _fallback(file_name, plan_label, plan_category)
-    return summary[:1000]
+    return summary[:2000]
 
 
 # ---------------------------------------------------------------------------
@@ -84,10 +86,12 @@ async def one_liner(
 _SYSTEM = (
     "You are a continuity-of-operations document analyst for the Ready2Go platform. "
     "Return ONLY valid JSON: "
-    "{\"summary\": \"<plain English paragraph, 5-6 sentences, max 900 chars, no markdown>\"} "
-    "Write a detailed paragraph that explains what this specific document IS, what it "
-    "covers, the key procedures, roles, scope, and timelines it defines, and any notable "
-    "gaps or missing elements — factually, grounded only in the text provided. "
+    "{\"summary\": \"<plain English, 8-12 sentences, max 1800 chars, no markdown>\"} "
+    "Write a thorough summary that captures ALL the major points of this specific document: "
+    "what it is and its purpose; the scope and what it covers; the key procedures and steps; "
+    "the roles and responsibilities it assigns; any timelines, recovery objectives (RTO/RPO), "
+    "or deadlines; the systems, resources, or dependencies it names; and any notable gaps or "
+    "missing elements. Be factual and grounded only in the text provided. "
     "No marketing language. Do not mention the file name."
 )
 
@@ -109,7 +113,7 @@ async def _call_one_liner(
             )},
         ],
         fallback={"summary": ""},
-        max_tokens=400,
+        max_tokens=700,
         log_call=log_call,
     )
     return result.get("summary", "")
@@ -123,9 +127,12 @@ async def _map_reduce(
     log_call: _LogCall = None,
 ) -> str:
     # MAP: chunk text into batches, get a short phrase per batch.
+    # No batch cap — every part of the document is summarised so the final
+    # summary reflects the WHOLE document, not just its opening. Cost stays
+    # bounded by using a larger batch size (fewer, bigger MAP calls).
     batches = [text[i:i + _BATCH_CHARS] for i in range(0, len(text), _BATCH_CHARS)]
     phrases = []
-    for batch in batches[:8]:   # cap at 8 batches (enough for very large docs)
+    for batch in batches:
         r = await chat_json(
             messages=[
                 {"role": "system", "content":
@@ -156,7 +163,7 @@ async def _map_reduce(
             )},
         ],
         fallback={"summary": ""},
-        max_tokens=400,
+        max_tokens=700,
         log_call=log_call,
     )
     return r.get("summary", "")
@@ -170,4 +177,4 @@ def _fallback(file_name: str, plan_label: str, plan_category: str) -> str:
         f"{cat} artifact '{file_name}' filed under the {plan_label} plan. "
         "Automated content analysis is pending — the document has been stored and "
         "will be summarised in detail on the next successful analysis run."
-    )[:1000]
+    )[:2000]

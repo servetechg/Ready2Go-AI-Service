@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     model_version: str = "integrity-v1"
     max_chunks_per_doc: int = 200
     audit_sample_cap: int = 25
+    # Fallback for the org audit: when AUDIT_SAMPLE_CAP=0 (send the full corpus to
+    # the audit LLM) and that call fails — typically because the payload exceeds
+    # the model's context window — the audit automatically retries with only the
+    # worst-scoring AUDIT_FALLBACK_CAP documents, so a usable AI narrative is still
+    # produced. The response is flagged degraded=true to signal the fallback.
+    audit_fallback_cap: int = 50
     # Composite integrity-signal weights (must sum to ~1.0).
     weight_content: float = 0.50
     weight_name: float = 0.19

@@ -15,7 +15,7 @@ Verifies:
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import respx
@@ -106,7 +106,6 @@ def mock_weaviate():
         patch("app.vectors.repo.upsert_chunks"),
         patch("app.vectors.repo.get_all_chunks", return_value=[]),
         patch("app.vectors.repo.sibling_similarities", return_value=[]),
-        patch("app.vectors.repo.hybrid_name_search", return_value=[]),
         patch("app.vectors.client.ensure_collections"),
     ):
         yield
@@ -266,7 +265,6 @@ class TestWeaviateDegradation:
             patch("app.vectors.repo.upsert_chunks", side_effect=RuntimeError("Weaviate down")),
             patch("app.vectors.repo.get_all_chunks", return_value=[]),
             patch("app.vectors.repo.sibling_similarities", return_value=[]),
-            patch("app.vectors.repo.hybrid_name_search", return_value=[]),
             patch("app.store.models.ensure_indexes"),
             patch("app.vectors.client.ensure_collections"),
         ):
@@ -350,7 +348,13 @@ class _FakeParser:
 
 class TestNameSignal:
     @respx.mock
-    def test_name_query_vector_passed_to_hybrid_search(self, mock_mongo):
+    def test_name_scored_from_filename_no_weaviate_hybrid(self, mock_mongo):
+        """Name = in-process cosine(filename, "label category"), no hybrid search.
+
+        With identical stub embeddings that cosine is 1.0, so name == 100 — and it
+        is computed without any Weaviate hybrid call (that function was removed),
+        so it can never be silently zeroed by a top-N ranking window.
+        """
         respx.get("https://example.com/bcp_document.pdf").mock(
             return_value=Response(
                 200, content=b"%PDF fake", headers={"Content-Type": "application/pdf"}
@@ -360,15 +364,13 @@ class TestNameSignal:
             side_effect=_embed_side_effect
         )
 
-        hybrid_mock = MagicMock(return_value=[])
         with (
             patch("app.store.models.ensure_indexes"),
             patch("app.vectors.client.ensure_collections"),
             patch("app.api.integrity.get_parser", return_value=_FakeParser()),
-            patch("app.vectors.repo.upsert_chunks"),
+            patch("app.vectors.repo.upsert_chunks", return_value=["uuid-1"]),
             patch("app.vectors.repo.get_all_chunks", return_value=[]),
             patch("app.vectors.repo.sibling_similarities", return_value=[]),
-            patch("app.vectors.repo.hybrid_name_search", hybrid_mock),
         ):
             from app.main import create_app
             client = TestClient(create_app(), raise_server_exceptions=False)
@@ -377,36 +379,29 @@ class TestNameSignal:
             )
 
         assert resp.status_code == 200
-        assert hybrid_mock.called, "hybrid_name_search must run once chunks are embedded"
-        # Positional args: (tenant, name_query, query_vector).
-        args = hybrid_mock.call_args.args
-        assert len(args) >= 3, "the query vector must be passed positionally"
-        query_vector = args[2]
-        assert isinstance(query_vector, list)
-        assert len(query_vector) == 1536, "query vector must match the embedding dim"
+        components = resp.json()["details"]["componentScores"]
+        assert components.get("name") == 100
 
     @respx.mock
-    def test_hybrid_failure_defaults_name_to_zero_not_500(self, mock_mongo):
+    def test_name_graceful_when_embeddings_fail(self, mock_mongo):
+        """If embeddings are unavailable, name defaults to 0 and the call still 200s."""
         respx.get("https://example.com/bcp_document.pdf").mock(
             return_value=Response(
                 200, content=b"%PDF fake", headers={"Content-Type": "application/pdf"}
             )
-        )
-        respx.post("https://api.openai.com/v1/embeddings").mock(
-            side_effect=_embed_side_effect
         )
 
         with (
             patch("app.store.models.ensure_indexes"),
             patch("app.vectors.client.ensure_collections"),
             patch("app.api.integrity.get_parser", return_value=_FakeParser()),
-            patch("app.vectors.repo.upsert_chunks"),
+            patch(
+                "app.api.integrity.embed_texts",
+                new=AsyncMock(side_effect=RuntimeError("embed down")),
+            ),
+            patch("app.vectors.repo.upsert_chunks", return_value=["uuid-1"]),
             patch("app.vectors.repo.get_all_chunks", return_value=[]),
             patch("app.vectors.repo.sibling_similarities", return_value=[]),
-            patch(
-                "app.vectors.repo.hybrid_name_search",
-                side_effect=RuntimeError("hybrid boom"),
-            ),
         ):
             from app.main import create_app
             client = TestClient(create_app(), raise_server_exceptions=False)
@@ -414,7 +409,6 @@ class TestNameSignal:
                 "/v1/integrity/analyze", json=ANALYZE_PAYLOAD, headers=_auth_headers()
             )
 
-        # A hybrid failure must be handled gracefully: name defaults to 0, no 500.
         assert resp.status_code == 200
         components = resp.json()["details"]["componentScores"]
         assert components.get("name") in (0, None)
@@ -443,9 +437,10 @@ class TestAuditGraceful:
                 "/v1/audit/summary", json=AUDIT_PAYLOAD, headers=_auth_headers()
             )
 
-        # Never a 500 — fallback built from the request payload.
+        # Never a 500 — fallback built from the request payload, flagged degraded.
         assert resp.status_code == 200
         body = resp.json()
         assert body["posture"] in {"Resilient", "Steady", "At Risk"}
         assert body["averageScore"] == 70
         assert isinstance(body["summary"], str) and body["summary"]
+        assert body["degraded"] is True

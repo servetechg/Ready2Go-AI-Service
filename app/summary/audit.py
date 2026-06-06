@@ -29,8 +29,14 @@ async def build(
     *,
     tenant_key: str,
     log_call: _LogCall = None,
-) -> AuditSummaryResponse:
+) -> tuple[AuditSummaryResponse, bool]:
     """Build a bounded AuditSummaryResponse.
+
+    Returns:
+        (response, llm_ok) — *llm_ok* is True only when the LLM actually produced
+        a narrative. It is False when the deterministic fallback text was used
+        (no API key, no plans, or the LLM call failed/empty). The caller uses
+        this to decide whether to retry with a smaller fallback sample.
 
     Args:
         state:      The ai_audit_state doc for this tenant.
@@ -64,14 +70,17 @@ async def build(
 
     if not settings.openai_api_key or totals["plans"] == 0:
         summary, findings = _fallback_text(totals, posture)
-        return AuditSummaryResponse(
-            summary=summary,
-            findings=findings,
-            posture=posture,
-            average_score=average_score,
+        return (
+            AuditSummaryResponse(
+                summary=summary,
+                findings=findings,
+                posture=posture,
+                average_score=average_score,
+            ),
+            False,  # deterministic fallback, not an LLM narrative
         )
 
-    summary, findings = await _llm_summary(
+    summary, findings, llm_ok = await _llm_summary(
         totals=totals,
         integrity=integrity,
         counts=counts,
@@ -80,11 +89,14 @@ async def build(
         log_call=log_call,
     )
 
-    return AuditSummaryResponse(
-        summary=summary,
-        findings=findings,
-        posture=posture,
-        average_score=average_score,
+    return (
+        AuditSummaryResponse(
+            summary=summary,
+            findings=findings,
+            posture=posture,
+            average_score=average_score,
+        ),
+        llm_ok,
     )
 
 
@@ -128,16 +140,20 @@ def derive_posture(state: dict) -> str:
 
 _SYSTEM = (
     "You are a Continuity-of-Operations auditor for the Ready2Go platform. "
-    "Given aggregate statistics and a sample of document summaries, produce "
-    "ONLY valid JSON: "
+    "You are given aggregate statistics and a list of analyzed documents in "
+    "`sampleDocs`; each entry has a `fileName`, `status`, `score`, `planId`, and a "
+    "`summary` describing what that document actually is. USE these per-document "
+    "summaries to ground your narrative and findings in the real content — name and "
+    "explain specific documents where relevant, not just the numbers. "
+    "Produce ONLY valid JSON: "
     "{\"summary\": \"<detailed narrative, 4-6 sentences, max 1400 chars, no markdown>\", "
     "\"findings\": [\"<actionable bullet that explains the issue and its impact, "
     "max 350 chars>\", ...]} "
     "Rules: 4 to 8 findings, ordered by urgency; each finding must explain what the "
-    "issue is, which plans/categories it affects, and why it matters. "
+    "issue is, which plans/documents/categories it affects, and why it matters. "
     "The summary should describe overall posture, coverage across categories, the "
-    "balance of Compliant vs Under Review vs Non-Compliant files, and the most "
-    "important risks. "
+    "balance of Compliant vs Under Review vs Non-Compliant files, what the documents "
+    "collectively cover, and the most important risks or gaps. "
     "Highlight: coverage gaps, low scores, Non-Compliant files, plans without "
     "steps or attachments, missing analysis. "
     "Do NOT give legal advice or recommend actions outside continuity management."
@@ -152,8 +168,13 @@ async def _llm_summary(
     average_score: int,
     sample: list[dict[str, Any]],
     log_call: _LogCall = None,
-) -> tuple[str, list[str]]:
-    """Call the LLM to produce summary + findings."""
+) -> tuple[str, list[str], bool]:
+    """Call the LLM to produce summary + findings.
+
+    Returns (summary, findings, llm_ok). llm_ok is False when the LLM call failed
+    or returned an empty summary (so the deterministic fallback text was used) —
+    the caller treats that as a signal to retry with a smaller fallback sample.
+    """
     payload = {
         "totals":             totals,
         "averageScore":       average_score,
@@ -179,10 +200,11 @@ async def _llm_summary(
         raw_findings = []
     findings = [str(f).strip()[:350] for f in raw_findings if str(f).strip()][:8]
 
+    llm_ok = bool(raw_summary)
     if not raw_summary:
         raw_summary, findings = _fallback_text(totals, "")
 
-    return raw_summary, findings
+    return raw_summary, findings, llm_ok
 
 
 def _fallback_text(totals: dict, posture: str) -> tuple[str, list[str]]:

@@ -52,7 +52,7 @@ answers three questions:
 1. **Does this document actually belong in the plan it was filed under?** → a **status**:
    `Compliant`, `Under Review`, or `Non-Compliant`.
 2. **How confident are we?** → a **score** from `0` to `100`.
-3. **What is this document, in plain English?** → a **summary** (a detailed paragraph, ≤ 1000 characters).
+3. **What is this document, in plain English?** → a **summary** (a detailed write-up covering all the major points, ≤ 2000 characters).
 
 It also produces an **organisation‑wide audit narrative**: a short paragraph + a few findings +
 an overall "posture" (`Resilient` / `Steady` / `At Risk`) summarising the health of *all* a
@@ -203,7 +203,9 @@ Because **they cache different things for different reasons:**
   engine can ask questions a cache never could:
   - *Content alignment* — how close is this document's meaning to the plan's description?
   - *Duplication* — is there a near‑identical sibling already in this plan?
-  - *Name search* — hybrid keyword+vector match of the filename to the plan.
+
+  (The *name* signal — filename vs plan label — is computed in-process from
+  embeddings, not via a Weaviate query.)
 
 In short: **MongoDB is the receipt drawer; Weaviate is the brain.** The cache makes us *fast and
 cheap*; the vector DB makes us *smart*. Remove the cache and the service still works but costs more;
@@ -213,8 +215,8 @@ remove Weaviate and the service can no longer score anything meaningfully.
 
 | Collection | Key | Purpose |
 |------------|-----|---------|
-| `ai_analysis_cache` | unique `(contentHash, modelVersion)` | Dedup cache of final verdicts. A hit = 0 tokens. |
-| `ai_audit_state` | `_id = tenantKey` | Per‑customer rolling counters (totals, integrity breakdown, score sum, "notable" worst files). Updated O(1) per analyze. Powers the audit endpoint without re‑scanning anything. |
+| `ai_analysis_cache` | unique `(contentHash, modelVersion)` | Dedup cache of final verdicts (status/score/summary/components). A hit = 0 tokens. Also stores `vectorIds` — the Weaviate chunk-object UUIDs for this document, as a direct reference to its vectors. |
+| `ai_audit_state` | `_id = tenantKey` | Per‑customer rolling counters (totals, integrity breakdown, score sum) plus two per‑doc lists — `notable` (worst‑20) and `all_analyzed` (every doc) — each entry holding `{fileName, status, score, planId, summary}` (summary excerpt ≤600 chars). Updated O(1) per analyze. Powers the audit endpoint without re‑scanning anything. |
 | `ai_call_log` | auto, sorted by `ts` | Append‑only record of every OpenAI call (kind, model, tokens, latency, success/error) for cost tracking and debugging. |
 
 > **Ownership boundary:** MongoDB's `ready2go` database is **shared** with the Next.js app. Next.js
@@ -284,7 +286,7 @@ numbers live in [app/scoring/thresholds.py](../app/scoring/thresholds.py) (sourc
 | # | Signal | Weight | What it measures | How it's computed |
 |---|--------|--------|------------------|-------------------|
 | 1 | **content** | **0.50** | Does the document's meaning match the plan? | Cosine similarity of the document **centroid** vs the embedding of `"{label} {overview} {steps}"`. Negative cosine clamped to 0. |
-| 2 | **name** | **0.19** | Does the filename match the plan? | Weaviate **hybrid** (BM25 keyword + vector) search of the filename against query `"{label} {category}"`. The query is embedded by us and passed in as a vector (DocChunk has no vectorizer), so the dense half actually runs. Result is 0…1. |
+| 2 | **name** | **0.19** | Does the filename match the plan? | **In-process cosine** between the embedding of the cleaned **filename** and the embedding of `"{label} {category}"`. Both are produced in the one batched OpenAI embed call. Per-document and absolute (0…1) — it does **not** depend on other documents, so a valid file can never be silently zeroed by ranking outside a top-N window (the earlier hybrid-search bug). |
 | 3 | **quality** | **0.19** | Did we extract real text? | Deterministic from extraction metadata: empty → `0.05`, scan‑only → `0.10`, `<500` chars → linear ramp `0.1→0.8`, beyond → log curve toward `1.0`. |
 | 4 | **duplication** | **0.12** | Is it a near‑duplicate of a sibling? | Maps nearest‑sibling cosine distance to `[0,1]`. No siblings → `1.0` (unique). Near‑identical → near `0`. |
 
@@ -319,16 +321,20 @@ All weights, bands, and the judge band are **environment‑configurable** — se
 ## 8. Summarization (Per‑Doc & Audit)
 
 ### Per‑document summary — `app/summary/per_doc.py`
-After scoring, the service writes a **detailed plain‑English paragraph** (5–6 sentences, ≤ 1000
-chars) describing **what the document is** — its scope, the procedures/roles/timelines it defines,
-and any notable gaps. Strategy "D7": it uses the **complete chunk set** of the document (we own the
-whole document, so no retrieval/subset is needed).
+After scoring, the service writes a **detailed plain‑English summary** (8–12 sentences, ≤ 2000
+chars) that captures **all the major points** of the document — its purpose, scope, key procedures
+and steps, roles/responsibilities, timelines/recovery objectives, named systems/dependencies, and
+any notable gaps. It is written this richly on purpose: the same summary is later fed into the
+organisation audit so the auditor can reason about each document's actual content. Strategy "D7": it
+uses the **complete chunk set** of the document (we own the whole document, so no retrieval/subset is
+needed).
 
 - **Short docs** (combined text ≤ 16,000 chars): a **single LLM pass** → `{"summary": "..."}`.
-- **Long docs** (> 16,000 chars): **map‑reduce** — summarise text in 6,000‑char batches (max 8)
-  into short phrases, then reduce those phrases into one final paragraph.
+- **Long docs** (> 16,000 chars): **map‑reduce** — summarise text in 12,000‑char batches (**no
+  batch cap**, so the whole document is covered, not just its opening) into short phrases, then
+  reduce those phrases into one final summary. Cost is bounded by the larger batch size.
 - **No OpenAI key / extraction failed:** a deterministic fallback like
-  `"{CATEGORY} artifact '{fileName}' … pending analysis"`. Always ≤ 1000 chars.
+  `"{CATEGORY} artifact '{fileName}' … pending analysis"`. Always ≤ 2000 chars.
 
 ### Organisation audit narrative — `app/summary/audit.py`
 `POST /v1/audit/summary` produces a short audit paragraph for the whole customer. It does **not**
@@ -337,8 +343,11 @@ re‑scan documents — it reads the **rolling counters** already accumulated in
 - **Posture** is **deterministic** (`derive_posture`): `At Risk` (no plans, any deviations, avg
   score < 55, or nothing analysed), `Steady` (any reviewing or avg < 75), else `Resilient`.
 - **Narrative** (`summary` ≤ 1500 chars + up to **8** `findings`, each ≤ 350 chars) is generated by
-  `gpt-4o-mini` from the totals, category counts, integrity breakdown, and a capped sample of the
-  worst‑scoring "notable" files. Falls back to a deterministic message if no key/plans.
+  `gpt-4o-mini` from the totals, category counts, integrity breakdown, and a sample of analyzed
+  documents — **each sample entry now carries that document's summary excerpt** (≤600 chars, stored
+  in `ai_audit_state`), so the auditor reasons about real content, not just scores. The sample is the
+  worst‑scoring docs (size set by `AUDIT_SAMPLE_CAP`; `0` = the whole corpus). Falls back to a
+  deterministic message if no key/plans.
 - **Always graceful:** if the rolling‑state read or the LLM reduce fails, the endpoint **does not
   500** — it logs the cause and returns a deterministic fallback built from the request payload
   (reusing `derive_posture`), leaving the audit state "dirty" so the next call retries.
@@ -479,7 +488,7 @@ Top‑level `AnalyzeRequest`:
 |-------|-------|------|---------|--------------------------|
 | `status` | — | `"Compliant"\|"Under Review"\|"Non-Compliant"` | The headline verdict. Exact strings — the UI keys off them. | "Our verdict on whether this document belongs in this plan. **Compliant** = good match (score ≥ 71); **Under Review** = borderline, worth a human look (41–70); **Non-Compliant** = likely mis‑filed or unreadable (below 41)." |
 | `score` | — | int 0–100 | Composite integrity score. | "An overall confidence score from 0–100 that this document fits the plan. It blends four checks: content match (50%), filename match (19%), text quality (19%), and uniqueness (12%)." |
-| `summary` | — | string ≤1000 | A detailed paragraph describing the document. | "An AI‑generated paragraph describing what this document actually is — its scope, key procedures, and any gaps — based on its full text." |
+| `summary` | — | string ≤2000 | A detailed write-up covering all the document's major points. | "An AI‑generated summary of what this document actually is — its purpose, scope, key procedures, roles, timelines, and any gaps — based on its full text." |
 | `analyzed_at` | `analyzedAt` | datetime (ISO) | When this response was produced. | "The date and time this analysis was performed." |
 | `model_version` | `modelVersion` | string | e.g. `integrity-v1`; bump invalidates cache. | "The version of the analysis model used. Shown so results can be compared fairly over time." |
 | `details` | — | object\|null | `AnalyzeDetails` (below). | "The detailed breakdown behind the score (see below)." |
@@ -602,6 +611,7 @@ Top‑level fields:
 | `findings` | — | string[] (≤8) | Key bullet findings. | "Up to eight key takeaways — the most important things to act on, such as coverage gaps or mis‑filed documents." |
 | `posture` | — | `"Resilient"\|"Steady"\|"At Risk"` | Deterministic overall posture. | "An overall readiness rating. **Resilient** = healthy; **Steady** = mostly fine with some items to review; **At Risk** = significant gaps or deviations that need attention." |
 | `average_score` | `averageScore` | int | Org average. | "The average integrity score (0–100) across all analysed files in the account." |
+| `degraded` | — | bool | True when a **reduced fallback sample** (worst-N) was used instead of the full set — e.g. the full-corpus audit was too big for the model, or an internal failure forced a payload-derived response. | "True means this audit was generated from a reduced set of documents (a safety fallback), so it may be less complete than usual. It will be regenerated fully on the next run." |
 
 ---
 
@@ -709,9 +719,9 @@ Configured in [app/logging.py](../app/logging.py) via **structlog** bridged into
   `pipeline.cache_hit`/`cache_miss`, `pipeline.extracted`, `pipeline.chunked`, `pipeline.embedded`,
   `pipeline.vectors_upserted`, `pipeline.scored`, `pipeline.llm_judge`, `pipeline.summarized`,
   `pipeline.persisted`, `pipeline.completed`, plus failure warnings (`pipeline.embed_failed_degraded`,
-  `pipeline.weaviate_read_failed`, `pipeline.name_search_failed`, `pipeline.sibling_search_failed`,
-  `pipeline.similar_files_failed`, …), `pipeline.timeout`, `pipeline.unexpected_error`, and
-  `integrity.analyzed`.
+  `pipeline.weaviate_read_failed`, `pipeline.query_embed_failed`, `pipeline.sibling_search_failed`,
+  `pipeline.similar_files_failed`, …), `pipeline.timeout`, `pipeline.unexpected_error`,
+  `integrity.analyzed`, plus `audit.fallback_sample` / `audit.summary_failed` on the audit path.
 - **Explanatory `detail` field.** Every WARNING/ERROR — and the key INFO milestones — carries a
   plain‑English `detail` string alongside the short dotted event code: it states *what happened, the
   impact (degraded / defaulting / skipped), and the likely cause*. The dotted code stays for
@@ -761,6 +771,7 @@ All settings are environment variables, loaded once and cached by `get_settings(
 | `MODEL_VERSION` | `integrity-v1` | A label stamped onto every result and used as part of the cache key. **This is your "cache reset" lever:** bump it (e.g. `integrity-v2`) whenever you change the embedding model, scoring logic, or prompts so old cached verdicts are ignored and documents get re‑analysed. |
 | `MAX_CHUNKS_PER_DOC` | `200` | Controls how many 500‑token slices a document is split into before embedding. **Set to `0` for no limit** — the entire document is chunked and embedded regardless of size (use when complete coverage matters more than cost, e.g. full compliance checks on large PDFs). Any positive value silently drops the tail beyond that count. Default `200` handles typical PDFs; `0` gives complete coverage at higher token cost. |
 | `AUDIT_SAMPLE_CAP` | `25` | Controls how many analyzed files are passed to the AI when generating the org audit narrative. **Set to `0` to pass ALL analyzed documents** — the AI gets the full picture (accurate but costs more tokens for large vaults). Any positive N passes only the worst-N scoring files. The `all_analyzed` array in `ai_audit_state` stores every analyzed doc (no score threshold, no cap) precisely for this. Default `25` = worst 25 files only; `0` = complete corpus. |
+| `AUDIT_FALLBACK_CAP` | `50` | Safety net for `AUDIT_SAMPLE_CAP=0`. If the full-corpus audit call fails (typically the payload exceeds the model's context window), the audit automatically **retries with only the worst-`AUDIT_FALLBACK_CAP` documents** and returns the result with **`degraded: true`** so the caller knows a reduced sample was used. Raise it for richer fallbacks, lower it to be safer/cheaper. |
 | `WEIGHT_CONTENT` | `0.50` | How much the **content‑match** signal counts toward the final score (the biggest factor — does the document's meaning match the plan?). The four weights should sum to ~1.0. Increase to punish off‑topic documents harder. |
 | `WEIGHT_NAME` | `0.19` | How much the **filename‑match** signal counts. Increase if filenames are reliable in your data; decrease if people name files randomly. |
 | `WEIGHT_QUALITY` | `0.19` | How much the **extraction‑quality** signal counts (did we actually get real text, or was it a blank/scanned page?). Increase to penalise unreadable uploads more. |
@@ -817,7 +828,7 @@ Every Python module under `app/`, its role, and key functions. (Who/what/why per
 ### `app/summary/` — natural‑language output
 | File | Role |
 |------|------|
-| [app/summary/per_doc.py](../app/summary/per_doc.py) | `one_liner()` — per‑doc ≤1000‑char paragraph summary (single‑pass or map‑reduce) with deterministic fallback. |
+| [app/summary/per_doc.py](../app/summary/per_doc.py) | `one_liner()` — per‑doc ≤2000‑char detailed summary covering all major points (single‑pass or map‑reduce) with deterministic fallback. |
 | [app/summary/audit.py](../app/summary/audit.py) | `build()` + `derive_posture()` — bounded org audit narrative (≤1500 chars, ≤8 findings, posture). |
 
 ### `app/vectors/` — the Weaviate layer
@@ -825,14 +836,14 @@ Every Python module under `app/`, its role, and key functions. (Who/what/why per
 |------|------|
 | [app/vectors/client.py](../app/vectors/client.py) | Lazy singleton Weaviate v4 client (`get_client`), `ensure_collections()` bootstrap, `close_client()`. Vectorizer disabled — we supply OpenAI vectors. |
 | [app/vectors/schema.py](../app/vectors/schema.py) | Collection definitions: `DocChunk` (multi‑tenant) properties. |
-| [app/vectors/repo.py](../app/vectors/repo.py) | CRUD + similarity ops: `upsert_chunks`, `delete_by_attachment`, `get_all_chunks`, `content_centroid`, `sibling_similarities`, `hybrid_name_search` (takes a query vector). Defines `StoredChunk`. |
+| [app/vectors/repo.py](../app/vectors/repo.py) | CRUD + similarity ops: `upsert_chunks` (returns inserted chunk UUIDs → stored in `ai_analysis_cache.vectorIds`), `delete_by_attachment`, `get_all_chunks` (paginated — reads every chunk, no fixed ceiling), `content_centroid`, `sibling_similarities`. Defines `StoredChunk`. |
 
 ### `app/store/` — the MongoDB layer
 | File | Role |
 |------|------|
 | [app/store/models.py](../app/store/models.py) | Request‑path Mongo client + collection accessors (`get_cache_col`/`get_state_col`/`get_log_col`) and `ensure_indexes()`. Collection name constants. |
 | [app/store/cache.py](../app/store/cache.py) | `get()` / `put()` for `ai_analysis_cache` (the dedup cache). |
-| [app/store/aggregate.py](../app/store/aggregate.py) | `update()` (O(1) `$inc` of rolling counters + bounded `notable` list), `read()`, `mark_clean()` for `ai_audit_state`. |
+| [app/store/aggregate.py](../app/store/aggregate.py) | `update()` (O(1) `$inc` of rolling counters + `$push` to `all_analyzed` and bounded `notable`, each entry carrying a ≤600‑char summary excerpt), `read()`, `mark_clean()` for `ai_audit_state`. |
 | [app/store/calllog.py](../app/store/calllog.py) | `append()` — one row per OpenAI call into `ai_call_log` (never raises). |
 | [app/store/mongo.py](../app/store/mongo.py) | Separate connection for **offline** prep/seed scripts; never imported by request‑path routes. |
 
@@ -868,7 +879,8 @@ uv run mypy app/         # type check
 ```
 Test suite covers: `test_scoring.py` (signal math + banding + scan/empty override), `test_analyze_contract.py`
 (auth guard, response contract, cache‑hit path, graceful Weaviate‑failure fallback, fetch→502, the
-**name‑signal query‑vector wiring** + hybrid‑failure handling, and the **graceful audit fallback**),
+**name signal scored from the filename** + graceful handling when embeddings fail, and the
+**graceful audit fallback**),
 `test_store_cache.py` (cache round‑trip + model‑version isolation), `test_ingest.py`, `test_health.py`.
 Mocks: `mongomock` (Mongo), `respx` (OpenAI HTTP), `unittest.mock` (Weaviate).
 

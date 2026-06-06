@@ -23,6 +23,7 @@ Flow for /analyze (see PHASE_B_VECTOR_IMPLEMENTATION_PLAN.md §1):
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -243,10 +244,11 @@ async def _run_pipeline(
     # 7. Upsert into Weaviate                                              #
     # ------------------------------------------------------------------ #
     weaviate_ok = False
+    vector_ids: list[str] = []
     if chunks and vectors:
         try:
             t0 = time.perf_counter()
-            await run_in_threadpool(
+            vector_ids = await run_in_threadpool(
                 vec.upsert_chunks,
                 tenant,
                 attachment_id,
@@ -262,6 +264,7 @@ async def _run_pipeline(
             log.info(
                 "pipeline.vectors_upserted",
                 count=len(vectors),
+                vector_ids=len(vector_ids),
                 tenant=tenant,
                 latency_ms=round((time.perf_counter() - t0) * 1000, 1),
             )
@@ -280,39 +283,46 @@ async def _run_pipeline(
     # ------------------------------------------------------------------ #
     # 8. Compute the signals -> composite score + status                  #
     # ------------------------------------------------------------------ #
-    # We need two query embeddings:
-    #   plan_vector       — for the content-alignment signal (doc vs plan).
-    #   name_query_vector — for the name-alignment hybrid search. DocChunk uses
-    #                       Vectorizer.none(), so Weaviate cannot embed the query
-    #                       string itself; we must supply this vector or the
-    #                       hybrid search fails (the old silent name=0 bug).
-    # Embed both in ONE batched OpenAI call to save a round-trip.
+    # We embed three short query strings in ONE batched OpenAI call:
+    #   plan_text  — "{label} {overview} {steps}" → content-alignment signal.
+    #   name_query — "{label} {category}"         → the plan side of the name signal.
+    #   name_text  — the cleaned filename         → the document side of the name signal.
+    # The name signal is then an ABSOLUTE cosine between name_text and name_query
+    # (see note below) — computed in-process, no Weaviate hybrid search needed.
     plan_text = f"{plan.label} {plan.overview} {' '.join(plan.steps)}"
     name_query = f"{plan.label} {plan.category}"
+    name_text = _clean_filename(att.file_name)
     plan_vector: list[float] | None = None
     name_query_vector: list[float] | None = None
+    name_text_vector: list[float] | None = None
     try:
         query_vectors = await embed_texts(
-            [plan_text, name_query], log_call=_make_log(attachment_id)
+            [plan_text, name_query, name_text], log_call=_make_log(attachment_id)
         )
         plan_vector = query_vectors[0] if len(query_vectors) > 0 else None
         name_query_vector = query_vectors[1] if len(query_vectors) > 1 else None
+        name_text_vector = query_vectors[2] if len(query_vectors) > 2 else None
     except Exception as exc:
         log.warning(
             "pipeline.query_embed_failed",
             detail=(
-                "Could not embed the plan-context and name-query text via OpenAI. "
-                "The content-alignment and name-alignment signals will both "
+                "Could not embed the plan-context / name-query / filename text via "
+                "OpenAI. The content-alignment and name-alignment signals will both "
                 "default to 0, lowering this document's score. Cause below."
             ),
             error=str(exc),
         )
 
+    # Name-alignment signal: absolute cosine of the (cleaned) filename vs the
+    # plan's "{label} {category}". This is per-document and has no dependence on
+    # how many other documents exist, so a valid file can never be silently
+    # pushed to 0 by ranking below a top-N window (the old hybrid-search bug).
+    name_score = sig.content_alignment(name_text_vector, name_query_vector)
+
     # Fetch stored chunks back (they have vectors attached) — skip if Weaviate failed.
     stored_chunks: list = []
     centroid: list[float] | None = None
     nearest_sibling_dist: float | None = None
-    hybrid_score: float | None = None
 
     if weaviate_ok:
         try:
@@ -349,40 +359,9 @@ async def _run_pipeline(
                     error=str(exc),
                 )
 
-        # Name-alignment hybrid search — needs the query vector (see above).
-        if name_query_vector is not None:
-            try:
-                hybrid_hits = await run_in_threadpool(
-                    vec.hybrid_name_search, tenant, name_query, name_query_vector
-                )
-                for h in hybrid_hits:
-                    if h.attachment_id == attachment_id:
-                        hybrid_score = h.similarity
-                        break
-            except Exception as exc:
-                log.warning(
-                    "pipeline.name_search_failed",
-                    detail=(
-                        "Hybrid name-match search failed, so the 'name' signal "
-                        "defaults to 0 and the score will be lower than it should "
-                        "be. Check the Weaviate hybrid query and that the query "
-                        "vector dimension matches the stored chunk vectors."
-                    ),
-                    error=str(exc),
-                )
-        else:
-            log.warning(
-                "pipeline.name_search_skipped",
-                detail=(
-                    "Skipped the name-match search because the name-query embedding "
-                    "was unavailable (OpenAI embed failed above). The 'name' signal "
-                    "defaults to 0 for this document."
-                ),
-            )
-
     signals = SignalInputs(
         content=sig.content_alignment(centroid, plan_vector),
-        name=sig.name_alignment(hybrid_score),
+        name=name_score,
         quality=sig.extraction_quality(quality),
         duplication=sig.duplication(nearest_sibling_dist),
     )
@@ -506,6 +485,7 @@ async def _run_pipeline(
             score=score,
             summary=summary_text,
             score_components=components,
+            vector_ids=vector_ids,
         )
         await run_in_threadpool(
             aggregate.update,
@@ -515,6 +495,7 @@ async def _run_pipeline(
             score=score,
             file_name=att.file_name,
             plan_id=plan.plan_id,
+            summary=summary_text,
         )
 
     log.info(
@@ -566,7 +547,7 @@ async def _run_pipeline(
     return AnalyzeResponse(
         status=int_status,
         score=score,
-        summary=summary_text[:1000],
+        summary=summary_text[:2000],
         analyzed_at=datetime.now(UTC),
         model_version=model_version,
         details=AnalyzeDetails(
@@ -678,6 +659,20 @@ def _make_log(attachment_id: str) -> _LogCall:
         row["attachmentId"] = attachment_id
         calllog.append(row)
     return _log
+
+
+def _clean_filename(file_name: str) -> str:
+    """Turn a filename into clean words for embedding.
+
+    Strips the extension and replaces separator punctuation with spaces so the
+    embedding reflects the words in the name rather than slug punctuation, e.g.
+    "fema_reconstitution-plan_template_10-22-19.pdf"
+        -> "fema reconstitution plan template 10 22 19".
+    """
+    stem = file_name.rsplit(".", 1)[0] if "." in file_name else file_name
+    cleaned = re.sub(r"[-_.]+", " ", stem)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or file_name
 
 
 def _normalize_status(s: str) -> str:

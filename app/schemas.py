@@ -91,7 +91,7 @@ class AnalyzeDetails(BaseModel):
 class AnalyzeResponse(BaseModel):
     status: IntegrityStatus
     score: int = Field(..., ge=0, le=100)
-    summary: str = Field(..., max_length=1000)
+    summary: str = Field(..., max_length=2000)
     analyzed_at: datetime = Field(..., alias="analyzedAt")
     model_version: str = Field(..., alias="modelVersion")
     details: AnalyzeDetails | None = None
@@ -171,5 +171,14 @@ class AuditSummaryResponse(BaseModel):
     findings: list[str] = Field(default_factory=list, max_length=8)
     posture: Posture
     average_score: int = Field(..., alias="averageScore")
+    degraded: bool = Field(
+        default=False,
+        description=(
+            "True when the audit could not be produced from the full document set "
+            "and a reduced fallback sample (worst-N) was used instead — or when an "
+            "internal failure forced a payload-derived fallback. The narrative is "
+            "based on fewer documents than requested."
+        ),
+    )
 
     model_config = {"populate_by_name": True}

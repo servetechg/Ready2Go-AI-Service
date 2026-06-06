@@ -22,8 +22,11 @@ from dataclasses import dataclass
 
 import httpx
 
-# Mirror the Next.js upload constraint (PROJECT_CONTEXT §7).
-MAX_BYTES = 25 * 1_024 * 1_024  # 25 MB
+# Maximum download size for an attachment. Raised above the Next.js upload limit
+# (25 MB) so the service can also ingest larger files fetched directly (e.g. big
+# .gov source PDFs during testing/seeding). Note: real user uploads are still
+# bounded by the Next.js side; this only caps what THIS service will download.
+MAX_BYTES = 50 * 1_024 * 1_024  # 50 MB
 
 _USER_AGENT = (
     "ready2go-ai-prep/0.1 "

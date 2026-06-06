@@ -71,12 +71,42 @@ async def summary(payload: AuditSummaryRequest) -> AuditSummaryResponse:
             calllog.append(row)
 
         # 4. Build audit narrative (bounded or full-corpus depending on config).
-        result = await build(
+        result, llm_ok = await build(
             state,
             sample,
             tenant_key=tenant,
             log_call=_log,
         )
+
+        # 4b. Fallback: a full-corpus audit (AUDIT_SAMPLE_CAP=0) that did NOT yield
+        #     an LLM narrative is most likely too large for the model's context.
+        #     Retry with only the worst-scoring AUDIT_FALLBACK_CAP documents and
+        #     flag the response degraded=True so the caller knows it was reduced.
+        if (
+            settings.audit_sample_cap == 0
+            and settings.openai_api_key
+            and not llm_ok
+            and len(sample) > settings.audit_fallback_cap
+        ):
+            fallback_sample = source_sorted[: settings.audit_fallback_cap]
+            log.warning(
+                "audit.fallback_sample",
+                detail=(
+                    "Full-corpus audit did not produce an AI narrative (likely the "
+                    "payload exceeded the model context). Retrying with the worst "
+                    f"{len(fallback_sample)} documents and flagging degraded=true."
+                ),
+                tenant=tenant,
+                full_sample=len(sample),
+                fallback_sample=len(fallback_sample),
+            )
+            result, _ = await build(
+                state,
+                fallback_sample,
+                tenant_key=tenant,
+                log_call=_log,
+            )
+            result.degraded = True
 
         # 5. Mark state clean.
         if tenant:
@@ -136,4 +166,5 @@ def _fallback_from_payload(payload: AuditSummaryRequest) -> AuditSummaryResponse
         findings=[],
         posture=posture,
         average_score=payload.average_score,
+        degraded=True,
     )
