@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 import openai
+import structlog
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -27,6 +28,8 @@ from tenacity import (
 )
 
 from app.config import get_settings
+
+log = structlog.get_logger(__name__)
 
 # Dimension for text-embedding-3-small
 EMBEDDING_DIM = 1536
@@ -95,6 +98,20 @@ async def embed_texts(
                 "success": False,
                 "error": str(exc),
             })
+        # Surface in the app/error logs too, then re-raise for the caller to handle
+        # (the analyze pipeline catches this and marks the result DEGRADED).
+        log.warning(
+            "llm.embed_failed",
+            detail=(
+                "OpenAI embedding call failed after retries. Re-raising so the caller "
+                "can degrade gracefully (the analyze pipeline skips vector storage and "
+                "marks the result DEGRADED). Cause below."
+            ),
+            model=model,
+            text_count=len(texts),
+            latency_ms=latency_ms,
+            error=str(exc),
+        )
         raise
 
 

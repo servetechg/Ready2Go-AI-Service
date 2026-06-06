@@ -26,4 +26,9 @@ htmlcov/
 .vscode/
 .DS_Store
 
+# Runtime log files and test reports (generated; never committed)
+logs/
+reports/
+data/staging/
+
 # NOTE: uv.lock IS committed (reproducible installs).

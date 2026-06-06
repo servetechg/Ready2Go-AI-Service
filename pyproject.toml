@@ -34,6 +34,8 @@ dependencies = [
     # Logging
     "structlog>=24.4",
     "numpy>=2.4.6",
+    # Metrics (lightweight in-process counters; also enables Prometheus scraping)
+    "prometheus-client>=0.21",
 ]
 
 [project.scripts]
@@ -44,6 +46,8 @@ main = "app.main:run"
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "mongomock>=4.3",
     "respx>=0.21",
     "ruff>=0.7",
     "mypy>=1.13",
@@ -80,4 +84,4 @@ files = ["app"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-q"
+addopts = "-q --junitxml=reports/junit.xml --cov=app --cov-report=html:reports/coverage --cov-report=term-missing"

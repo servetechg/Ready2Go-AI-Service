@@ -3,7 +3,7 @@
 All thresholds and weights come from settings so they can be tuned without
 a code change.  This module is the single source of truth for:
   - signal weights (must sum to ~1.0)
-  - status banding (score -> In Sync / Reviewing / Deviation Found)
+  - status banding (score -> Compliant / Under Review / Non-Compliant)
   - LLM judge band (borderline range that triggers an optional AI tie-break)
 """
 
@@ -22,7 +22,6 @@ class Weights:
     """
     content: float
     name: float
-    category: float
     quality: float
     duplication: float
 
@@ -31,9 +30,9 @@ class Weights:
 class Bands:
     """Status banding thresholds (0-100 integer scale).
 
-    score >= in_sync   -> "In Sync"
-    score >= reviewing -> "Reviewing"
-    else               -> "Deviation Found"
+    score >= in_sync   -> "Compliant"
+    score >= reviewing -> "Under Review"
+    else               -> "Non-Compliant"
     """
     in_sync: int
     reviewing: int
@@ -54,7 +53,6 @@ def get_weights() -> Weights:
     return Weights(
         content=s.weight_content,
         name=s.weight_name,
-        category=s.weight_category,
         quality=s.weight_quality,
         duplication=s.weight_duplication,
     )
@@ -78,12 +76,12 @@ def get_judge_band() -> JudgeBand:
 def score_to_status(score: int, bands: Bands | None = None) -> str:
     """Map an integer score 0-100 to an integrity status string.
 
-    Returns one of: "In Sync", "Reviewing", "Deviation Found".
+    Returns one of: "Compliant", "Under Review", "Non-Compliant".
     These exact strings are the contract with the Next.js UI.
     """
     b = bands or get_bands()
     if score >= b.in_sync:
-        return "In Sync"
+        return "Compliant"
     if score >= b.reviewing:
-        return "Reviewing"
-    return "Deviation Found"
+        return "Under Review"
+    return "Non-Compliant"

@@ -16,16 +16,24 @@ Schema (ai_call_log):
 
 from __future__ import annotations
 
-import contextlib
 from datetime import UTC, datetime
 from typing import Any
 
+import structlog
+
 from app.store.models import get_log_col
+
+log = structlog.get_logger(__name__)
 
 
 def append(row: dict[str, Any]) -> None:
-    """Insert one call-log row.  Never raises — log failures are swallowed."""
-    with contextlib.suppress(Exception):
+    """Insert one call-log row.
+
+    Non-fatal by design: the AI cost/audit trail must never break a live request.
+    But the failure is no longer fully silent — it is logged at WARNING so a
+    broken ai_call_log sink (e.g. Mongo down) is visible instead of hidden.
+    """
+    try:
         get_log_col().insert_one({
             "ts":           datetime.now(UTC),
             "kind":         row.get("kind", ""),
@@ -36,3 +44,15 @@ def append(row: dict[str, Any]) -> None:
             "success":      row.get("success", False),
             "error":        row.get("error"),
         })
+    except Exception as exc:
+        log.warning(
+            "calllog.append_failed",
+            detail=(
+                "Could not write a row to the ai_call_log audit trail. The request "
+                "itself is unaffected (this is best-effort cost/audit logging), but "
+                "AI call metrics will be incomplete until the log sink recovers. "
+                "Cause below."
+            ),
+            kind=row.get("kind", ""),
+            error=str(exc),
+        )

@@ -45,13 +45,17 @@ def chunk(
     """Split *text* into overlapping token-bounded chunks.
 
     Args:
-        text:          The full extracted document text.
-        max_chunks:    Hard upper bound on chunks produced (from settings).
-        chunk_tokens:  Target tokens per chunk (default 500).
+        text:           The full extracted document text.
+        max_chunks:     Hard upper bound on chunks produced (from settings).
+                        Set to 0 for no limit — the entire document is chunked
+                        regardless of size (useful when complete coverage matters
+                        more than cost).  Any positive value drops the tail beyond
+                        that count.
+        chunk_tokens:   Target tokens per chunk (default 500).
         overlap_tokens: Tokens shared between consecutive chunks (default 50).
 
     Returns:
-        List of Chunk objects, at most max_chunks long.
+        List of Chunk objects, at most max_chunks long (or unlimited if 0).
         Empty if text is empty or whitespace-only.
     """
     text = text.strip()
@@ -71,7 +75,7 @@ def chunk(
     chunks: list[Chunk] = []
     start = 0
 
-    while start < total and len(chunks) < max_chunks:
+    while start < total and (max_chunks == 0 or len(chunks) < max_chunks):
         end = min(start + chunk_tokens, total)
         window_ids = token_ids[start:end]
         chunk_text = _ENCODING.decode(window_ids)

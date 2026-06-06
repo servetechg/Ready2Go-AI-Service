@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     reload: bool = False
     request_timeout_s: float = 25.0
 
+    # ---- Logging --------------------------------------------------------
+    log_dir: str = "logs"
+    log_max_bytes: int = 10 * 1024 * 1024   # 10 MB per file
+    log_backups: int = 5
+
     # ---- Auth (Next.js -> this service) --------------------------------
     python_integrity_token: str = Field(default="", description="Shared bearer token")
     hmac_secret: str = Field(default="", description="Optional HMAC body-signing secret")
@@ -39,6 +44,18 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_embed_model: str = "text-embedding-3-small"
     openai_summary_model: str = "gpt-4o-mini"
+
+    @field_validator("openai_embed_model", mode="before")
+    @classmethod
+    def _embed_model_default(cls, v: str | None) -> str:
+        # A blank env value (OPENAI_EMBED_MODEL=) must not override the default
+        # with an empty string — that would make OpenAI reject the request (400).
+        return (v or "").strip() or "text-embedding-3-small"
+
+    @field_validator("openai_summary_model", mode="before")
+    @classmethod
+    def _summary_model_default(cls, v: str | None) -> str:
+        return (v or "").strip() or "gpt-4o-mini"
 
     # ---- Weaviate (vector store) ---------------------------------------
     weaviate_url: str = ""
@@ -80,16 +97,20 @@ class Settings(BaseSettings):
     max_chunks_per_doc: int = 200
     audit_sample_cap: int = 25
     # Composite integrity-signal weights (must sum to ~1.0).
-    weight_content: float = 0.40
-    weight_name: float = 0.15
-    weight_category: float = 0.20
-    weight_quality: float = 0.15
-    weight_duplication: float = 0.10
+    weight_content: float = 0.50
+    weight_name: float = 0.19
+    weight_quality: float = 0.19
+    weight_duplication: float = 0.12
     # Status banding thresholds (0..100).
     band_in_sync: int = 71
     band_reviewing: int = 41
     # Borderline band that triggers the optional LLM judge, e.g. "60,72".
     llm_judge_band: str = "60,72"
+
+    # ---- Document parser backend ---------------------------------------
+    # "basic" (default) uses pdfplumber/pypdf/docx/xlsx.
+    # Switch to "liteparse" via env when a drop-in LiteParse adapter is added.
+    parser_backend: str = "basic"
 
     @property
     def is_production(self) -> bool:
@@ -100,3 +121,29 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return the cached, process-wide settings instance."""
     return Settings()
+
+
+def validate_production_secrets(settings: Settings) -> None:
+    """Raise RuntimeError if required production secrets are absent.
+
+    Call this at startup when env == production so the service refuses to
+    boot rather than silently opening auth holes or crashing mid-request.
+    """
+    if not settings.is_production:
+        return
+
+    missing = []
+    if not settings.openai_api_key:
+        missing.append("OPENAI_API_KEY")
+    if not settings.weaviate_url:
+        missing.append("WEAVIATE_URL")
+    if not settings.mongodb_uri:
+        missing.append("MONGODB_URI")
+    if not settings.python_integrity_token:
+        missing.append("PYTHON_INTEGRITY_TOKEN")
+
+    if missing:
+        raise RuntimeError(
+            f"Production startup blocked — required secrets missing: {', '.join(missing)}. "
+            "Set them in the environment before starting the service."
+        )

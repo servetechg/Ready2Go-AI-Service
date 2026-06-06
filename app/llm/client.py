@@ -1,7 +1,7 @@
 """Chat-completions wrapper: retry, JSON output, token metering.
 
 Used by:
-  - summary/per_doc.py   — generate the <=280-char one-liner
+  - summary/per_doc.py   — generate the <=1000-char paragraph summary
   - scoring/integrity.py — optional LLM judge for borderline scores (60-72 band)
   - summary/audit.py     — bounded vault audit narrative
 
@@ -17,6 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 import openai
+import structlog
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -27,6 +28,8 @@ from tenacity import (
 )
 
 from app.config import get_settings
+
+log = structlog.get_logger(__name__)
 
 _RETRYABLE = (openai.RateLimitError, openai.APIConnectionError, openai.APIStatusError)
 _RETRY = retry(
@@ -96,6 +99,19 @@ async def chat_json(
                 "success": False,
                 "error": str(exc),
             })
+        # Surface in the app/error logs too — not only the ai_call_log DB trail —
+        # so a recurring chat failure (bad key, parse error, outage) is visible.
+        log.warning(
+            "llm.chat_failed",
+            detail=(
+                "OpenAI chat-completion call failed or its JSON could not be parsed "
+                "after retries; returning the caller's fallback value so the pipeline "
+                "degrades gracefully. Cause below."
+            ),
+            model=effective_model,
+            latency_ms=latency_ms,
+            error=str(exc),
+        )
         return fallback
 
 
@@ -106,7 +122,7 @@ async def _chat_with_retry(
     messages: list[dict[str, str]],
     max_tokens: int,
 ) -> Any:
-    return await client.chat.completions.create(
+    return await client.chat.completions.create(  # type: ignore[call-overload]
         model=model,
         messages=messages,  # type: ignore[arg-type]
         response_format={"type": "json_object"},

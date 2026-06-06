@@ -1,7 +1,9 @@
-# Local development stack: the API + its two backing stores (Weaviate + MongoDB).
-# Both are self-hosted/open-source here for dev; production points at managed
-# equivalents via .env. Python keeps its own `ai_*` collections inside the same
-# MongoDB database as the app (default "ready2go"); no separate state DB.
+# Dev stack: the API + a local Weaviate for vectors.
+#
+# MongoDB is NOT run locally — the service connects to the Atlas cluster defined
+# by MONGODB_URI in .env (the same `ready2go` DB the Next.js app uses). Python
+# keeps its own `ai_*` collections inside that DB; it never writes app domain docs.
+# Weaviate is self-hosted here for dev; production points at a managed equivalent.
 
 services:
   api:
@@ -11,27 +13,20 @@ services:
     env_file:
       - .env
     environment:
-      # Local dev defaults (override via .env for staging/prod).
-      MONGODB_URI: mongodb://mongo:27017
-      MONGODB_DB: ready2go
+      # MONGODB_URI / MONGODB_DB come from .env (Atlas).
+      # Only override what's container-specific:
       WEAVIATE_URL: http://weaviate:8080
+      # No file-watch reload inside the container.
+      RELOAD: "false"
     depends_on:
-      mongo:
-        condition: service_healthy
       weaviate:
         condition: service_started
-
-  mongo:
-    image: mongo:7
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo_data:/data/db
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   weaviate:
     image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
@@ -48,5 +43,4 @@ services:
       - weaviate_data:/var/lib/weaviate
 
 volumes:
-  mongo_data:
   weaviate_data:

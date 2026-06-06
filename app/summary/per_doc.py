@@ -1,4 +1,4 @@
-"""Per-document <=280-char one-liner.
+"""Per-document <=1000-char detailed paragraph summary.
 
 Approach (D7 — full-document, no retrieval subset):
   - Use the complete chunk set (all of this document's chunks from Weaviate).
@@ -12,9 +12,14 @@ Approach (D7 — full-document, no retrieval subset):
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 from app.config import get_settings
 from app.llm.client import chat_json
 from app.vectors.repo import StoredChunk
+
+_LogCall = Callable[[dict[str, Any]], None] | None
 
 # Rough character budget per LLM call before we switch to map-reduce.
 # ~4 chars/token, 4000 tokens of context headroom = ~16 000 chars.
@@ -30,9 +35,9 @@ async def one_liner(
     file_name: str,
     plan_label: str,
     plan_category: str,
-    log_call=None,
+    log_call: _LogCall = None,
 ) -> str:
-    """Generate a <=280-char plain-English one-liner for this document.
+    """Generate a <=1000-char plain-English paragraph summary for this document.
 
     Args:
         chunks:        ALL chunks for this attachment (from get_all_chunks).
@@ -42,7 +47,7 @@ async def one_liner(
         log_call:      Optional calllog.append callback.
 
     Returns:
-        <=280-char plain-English string.  Never empty (falls back to a
+        <=1000-char plain-English paragraph.  Never empty (falls back to a
         deterministic description if the LLM fails).
     """
     settings = get_settings()
@@ -69,7 +74,7 @@ async def one_liner(
     summary = str(raw).strip()
     if not summary:
         return _fallback(file_name, plan_label, plan_category)
-    return summary[:280]
+    return summary[:1000]
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +83,11 @@ async def one_liner(
 
 _SYSTEM = (
     "You are a continuity-of-operations document analyst for the Ready2Go platform. "
-    "Return ONLY valid JSON: {\"summary\": \"<plain English, max 220 chars, no markdown>\"} "
-    "Describe what this specific document IS and does — factually, grounded in the text. "
+    "Return ONLY valid JSON: "
+    "{\"summary\": \"<plain English paragraph, 5-6 sentences, max 900 chars, no markdown>\"} "
+    "Write a detailed paragraph that explains what this specific document IS, what it "
+    "covers, the key procedures, roles, scope, and timelines it defines, and any notable "
+    "gaps or missing elements — factually, grounded only in the text provided. "
     "No marketing language. Do not mention the file name."
 )
 
@@ -89,7 +97,7 @@ async def _call_one_liner(
     file_name: str,
     plan_label: str,
     plan_category: str,
-    log_call=None,
+    log_call: _LogCall = None,
 ) -> str:
     result = await chat_json(
         messages=[
@@ -101,7 +109,7 @@ async def _call_one_liner(
             )},
         ],
         fallback={"summary": ""},
-        max_tokens=120,
+        max_tokens=400,
         log_call=log_call,
     )
     return result.get("summary", "")
@@ -112,7 +120,7 @@ async def _map_reduce(
     file_name: str,
     plan_label: str,
     plan_category: str,
-    log_call=None,
+    log_call: _LogCall = None,
 ) -> str:
     # MAP: chunk text into batches, get a short phrase per batch.
     batches = [text[i:i + _BATCH_CHARS] for i in range(0, len(text), _BATCH_CHARS)]
@@ -148,7 +156,7 @@ async def _map_reduce(
             )},
         ],
         fallback={"summary": ""},
-        max_tokens=120,
+        max_tokens=400,
         log_call=log_call,
     )
     return r.get("summary", "")
@@ -158,4 +166,8 @@ def _fallback(file_name: str, plan_label: str, plan_category: str) -> str:
     """Deterministic description when the LLM is unavailable."""
     cat_map = {"coop": "COOP", "bcp": "BCP", "compliance": "Compliance"}
     cat = cat_map.get(plan_category, "continuity")
-    return f"{cat} artifact '{file_name}' filed under {plan_label} — pending analysis."[:280]
+    return (
+        f"{cat} artifact '{file_name}' filed under the {plan_label} plan. "
+        "Automated content analysis is pending — the document has been stored and "
+        "will be summarised in detail on the next successful analysis run."
+    )[:1000]

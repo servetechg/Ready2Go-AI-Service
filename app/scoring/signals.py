@@ -5,12 +5,10 @@ No I/O, no side effects — fully unit-testable without mocking anything.
 
 Signal             Weight  What it measures
 ---------          ------  ----------------
-content_alignment  0.40    Doc centroid vs plan-context embedding (cosine).
-name_alignment     0.15    Hybrid search score of filename vs plan label.
-category_fit       0.20    Centroid vs declared-category prototype; penalised
-                           if a different category scores higher (mis-filed).
-extraction_quality 0.15    Chars/pages extracted; scan-only / empty penalty.
-duplication        0.10    Nearest-sibling distance; near-dups score low.
+content_alignment  0.50    Doc centroid vs plan-context embedding (cosine).
+name_alignment     0.19    Hybrid search score of filename vs plan label.
+extraction_quality 0.19    Chars/pages extracted; scan-only / empty penalty.
+duplication        0.12    Nearest-sibling distance; near-dups score low.
 
 Weights live in config (thresholds.py); this module does not read config.
 """
@@ -58,43 +56,7 @@ def name_alignment(hybrid_score: float | None) -> float:
 
 
 # ---------------------------------------------------------------------------
-# 3. Category fit
-# ---------------------------------------------------------------------------
-
-def category_fit(
-    declared_category: str,
-    prototype_sims: dict[str, float],
-) -> float:
-    """How well the doc fits its declared category vs other categories.
-
-    Logic:
-    - Base score = similarity of doc centroid to the declared category prototype.
-    - Penalty: if a DIFFERENT category prototype scores higher (the doc looks
-      like it belongs elsewhere), subtract a penalty proportional to the gap.
-    - Returns 0.0 if no prototypes are available (graceful degradation).
-    """
-    if not prototype_sims:
-        return 0.5  # neutral when prototypes not seeded yet
-
-    declared_sim = prototype_sims.get(declared_category, 0.0)
-    other_sims = [v for k, v in prototype_sims.items() if k != declared_category]
-
-    if not other_sims:
-        # Only one category prototype exists — use its similarity directly.
-        return float(max(0.0, min(1.0, declared_sim)))
-
-    best_other = max(other_sims)
-    if best_other > declared_sim:
-        # Mis-filed: penalise proportionally to the gap.
-        gap = best_other - declared_sim
-        penalised = max(0.0, declared_sim - gap * 0.5)
-        return float(penalised)
-
-    return float(max(0.0, min(1.0, declared_sim)))
-
-
-# ---------------------------------------------------------------------------
-# 4. Extraction quality
+# 3. Extraction quality
 # ---------------------------------------------------------------------------
 
 # Thresholds for "good" extraction — rough empirical targets.
@@ -128,7 +90,7 @@ def extraction_quality(quality: ExtractionQuality) -> float:
 
 
 # ---------------------------------------------------------------------------
-# 5. Duplication
+# 4. Duplication
 # ---------------------------------------------------------------------------
 
 def duplication(nearest_sibling_distance: float | None) -> float:

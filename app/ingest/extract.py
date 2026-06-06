@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import csv
 import io
-import logging
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+import structlog
+
 from app.config import get_settings
 
-logger = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 # A file with fewer chars than this is considered "empty".
 _MIN_CHARS = 30
@@ -95,8 +96,19 @@ class BasicParser:
                 return self._xlsx(data)
             if e == "csv":
                 return self._csv(data)
-        except Exception:
-            logger.exception("BasicParser.extract failed for ext=%s", ext)
+        except Exception as exc:
+            log.warning(
+                "extract.parse_failed",
+                detail=(
+                    f"Text extraction for a '{ext}' file raised, so an empty "
+                    "extraction is returned. The document will score low on quality "
+                    "and be flagged empty/scan-only. This usually means a corrupt, "
+                    "password-protected, or unsupported file. Cause below."
+                ),
+                ext=ext,
+                error=str(exc),
+                exc_info=True,
+            )
         return _empty_extraction()
 
     # ---- per-type private methods ----------------------------------------
@@ -195,15 +207,31 @@ def _pdf_pdfplumber(data: bytes) -> tuple[str, int]:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
             pages = len(pdf.pages)
             parts = []
-            for page in pdf.pages:
+            for page_num, page in enumerate(pdf.pages):
                 try:
                     t = page.extract_text() or ""
                     if t.strip():
                         parts.append(t)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log.debug(
+                        "extract.pdfplumber_page_failed",
+                        detail=(
+                            "pdfplumber could not extract text from one PDF page; "
+                            "skipping that page and continuing with the rest."
+                        ),
+                        page=page_num,
+                        error=str(exc),
+                    )
             return "\n".join(parts), pages
-    except Exception:
+    except Exception as exc:
+        log.debug(
+            "extract.pdfplumber_failed",
+            detail=(
+                "pdfplumber could not open the PDF at all; the caller falls back to "
+                "pypdf next."
+            ),
+            error=str(exc),
+        )
         return "", 0
 
 
@@ -213,15 +241,31 @@ def _pdf_pypdf(data: bytes) -> tuple[str, int]:
         reader = pypdf.PdfReader(io.BytesIO(data))
         pages = len(reader.pages)
         parts = []
-        for page in reader.pages:
+        for page_num, page in enumerate(reader.pages):
             try:
                 t = page.extract_text() or ""
                 if t.strip():
                     parts.append(t)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.debug(
+                    "extract.pypdf_page_failed",
+                    detail=(
+                        "pypdf could not extract text from one PDF page; skipping "
+                        "that page and continuing with the rest."
+                    ),
+                    page=page_num,
+                    error=str(exc),
+                )
         return "\n".join(parts), pages
-    except Exception:
+    except Exception as exc:
+        log.debug(
+            "extract.pypdf_failed",
+            detail=(
+                "pypdf (the PDF fallback parser) could not read the PDF; the document "
+                "will be treated as having no extractable text."
+            ),
+            error=str(exc),
+        )
         return "", 0
 
 

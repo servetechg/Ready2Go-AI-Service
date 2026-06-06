@@ -3,7 +3,7 @@
 These mirror the "Shared input/response payload" and the `ContinuityAudit*`
 shapes documented in the architecture (§5) and PROJECT_CONTEXT (§11). Field names
 and value constraints are a HARD contract: the Next.js UI keys off the exact
-status strings and the ≤280/≤360-char limits.
+status strings and the ≤1000/≤1500-char limits.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-IntegrityStatus = Literal["In Sync", "Reviewing", "Deviation Found"]
+IntegrityStatus = Literal["Compliant", "Under Review", "Non-Compliant"]
 Posture = Literal["Resilient", "Steady", "At Risk"]
 PlanCategory = Literal["coop", "bcp", "compliance"]
 StoredOrResponseCategory = Literal["coop", "bcp", "compliance", "response"]
@@ -65,7 +65,6 @@ class AnalyzeRequest(BaseModel):
 class ComponentScores(BaseModel):
     content: int | None = None
     name: int | None = None
-    category: int | None = None
     quality: int | None = None
     duplication: int | None = None
 
@@ -81,6 +80,10 @@ class AnalyzeDetails(BaseModel):
     component_scores: ComponentScores | None = Field(default=None, alias="componentScores")
     similar_files: list[SimilarFile] = Field(default_factory=list, alias="similarFiles")
     cache_hit: bool = Field(default=False, alias="cacheHit")
+    degraded: bool = Field(
+        default=False,
+        description="True when one or more dependencies (Weaviate/OpenAI) were unreachable.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -88,7 +91,7 @@ class AnalyzeDetails(BaseModel):
 class AnalyzeResponse(BaseModel):
     status: IntegrityStatus
     score: int = Field(..., ge=0, le=100)
-    summary: str = Field(..., max_length=280)
+    summary: str = Field(..., max_length=1000)
     analyzed_at: datetime = Field(..., alias="analyzedAt")
     model_version: str = Field(..., alias="modelVersion")
     details: AnalyzeDetails | None = None
@@ -164,8 +167,8 @@ class AuditSummaryRequest(BaseModel):
 
 
 class AuditSummaryResponse(BaseModel):
-    summary: str = Field(..., max_length=360)
-    findings: list[str] = Field(default_factory=list, max_length=4)
+    summary: str = Field(..., max_length=1500)
+    findings: list[str] = Field(default_factory=list, max_length=8)
     posture: Posture
     average_score: int = Field(..., alias="averageScore")
 

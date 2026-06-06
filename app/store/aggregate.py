@@ -7,13 +7,18 @@ ai_audit_state document shape (one per tenantKey, _id = tenantKey):
     integrity:     {inSync: N, reviewing: N, deviation: N, unanalyzed: N},
     scoreSum:      N,
     scoreCount:    N,
-    notable:       [{fileName, status, score, planId}],  # bounded list
+    notable:       [{fileName, status, score, planId}],  # worst-N (score<60), bounded
+    all_analyzed:  [{fileName, status, score, planId}],  # every doc, no cap/threshold
     dirty:         bool,  # True when a new analyze happened since last audit
     updatedAt:     datetime,
   }
 
-update() increments counters in a single MongoDB $inc/$set — never reads or
+update() increments counters in a single MongoDB $inc/$set/$push — never reads or
 rewrites the whole doc.  This is what makes the audit O(1) per upload.
+
+all_analyzed holds every analyzed doc regardless of score so the audit endpoint
+can pass ALL docs to the LLM when AUDIT_SAMPLE_CAP=0.  notable keeps the
+worst-20 (score<60) for cheap fast access when a bounded sample is sufficient.
 """
 
 from __future__ import annotations
@@ -49,9 +54,9 @@ def update(
 
     # Map status string -> integrity sub-field name.
     integrity_field = {
-        "In Sync":        "integrity.inSync",
-        "Reviewing":      "integrity.reviewing",
-        "Deviation Found":"integrity.deviation",
+        "Compliant":     "integrity.inSync",
+        "Under Review":  "integrity.reviewing",
+        "Non-Compliant": "integrity.deviation",
     }.get(status, "integrity.unanalyzed")
 
     # Map category -> counts sub-field.
@@ -72,11 +77,21 @@ def update(
         "$setOnInsert": {
             "_id": tenant_key,
         },
+        # Always record every analyzed doc — no score threshold, no cap.
+        # AUDIT_SAMPLE_CAP=0 uses this list to give the LLM the full corpus.
+        "$push": {
+            "all_analyzed": {
+                "fileName": file_name,
+                "status":   status,
+                "score":    score,
+                "planId":   plan_id,
+            }
+        },
     }
 
     col.update_one({"_id": tenant_key}, update_doc, upsert=True)
 
-    # Add to notable list if score is below threshold — bounded by cap.
+    # Also keep a bounded notable list (worst-N, score < threshold) for fast access.
     if score < _NOTABLE_THRESHOLD:
         col.update_one(
             {"_id": tenant_key},
@@ -111,11 +126,12 @@ def mark_clean(tenant_key: str) -> None:
 
 def _zero_state() -> dict[str, Any]:
     return {
-        "counts":     {"coop": 0, "bcp": 0, "compliance": 0, "response": 0},
-        "integrity":  {"inSync": 0, "reviewing": 0, "deviation": 0, "unanalyzed": 0},
-        "scoreSum":   0,
-        "scoreCount": 0,
-        "notable":    [],
-        "dirty":      False,
-        "updatedAt":  None,
+        "counts":       {"coop": 0, "bcp": 0, "compliance": 0, "response": 0},
+        "integrity":    {"inSync": 0, "reviewing": 0, "deviation": 0, "unanalyzed": 0},
+        "scoreSum":     0,
+        "scoreCount":   0,
+        "notable":      [],
+        "all_analyzed": [],
+        "dirty":        False,
+        "updatedAt":    None,
     }

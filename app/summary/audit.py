@@ -13,17 +13,22 @@ PROJECT_CONTEXT §6.5 verbatim so the frontend gets consistent behaviour.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 from app.config import get_settings
 from app.llm.client import chat_json
 from app.schemas import AuditSummaryResponse
 
+_LogCall = Callable[[dict[str, Any]], None] | None
+
 
 async def build(
-    state: dict,
-    sample: list[dict],
+    state: dict[str, Any],
+    sample: list[dict[str, Any]],
     *,
     tenant_key: str,
-    log_call=None,
+    log_call: _LogCall = None,
 ) -> AuditSummaryResponse:
     """Build a bounded AuditSummaryResponse.
 
@@ -63,7 +68,7 @@ async def build(
             summary=summary,
             findings=findings,
             posture=posture,
-            averageScore=average_score,
+            average_score=average_score,
         )
 
     summary, findings = await _llm_summary(
@@ -79,7 +84,7 @@ async def build(
         summary=summary,
         findings=findings,
         posture=posture,
-        averageScore=average_score,
+        average_score=average_score,
     )
 
 
@@ -125,10 +130,15 @@ _SYSTEM = (
     "You are a Continuity-of-Operations auditor for the Ready2Go platform. "
     "Given aggregate statistics and a sample of document summaries, produce "
     "ONLY valid JSON: "
-    "{\"summary\": \"<1-2 sentences, plain English, max 360 chars, no markdown>\", "
-    "\"findings\": [\"<short actionable bullet, max 140 chars>\", ...]} "
-    "Rules: 2 to 4 findings, ordered by urgency. "
-    "Highlight: coverage gaps, low scores, Deviation Found files, plans without "
+    "{\"summary\": \"<detailed narrative, 4-6 sentences, max 1400 chars, no markdown>\", "
+    "\"findings\": [\"<actionable bullet that explains the issue and its impact, "
+    "max 350 chars>\", ...]} "
+    "Rules: 4 to 8 findings, ordered by urgency; each finding must explain what the "
+    "issue is, which plans/categories it affects, and why it matters. "
+    "The summary should describe overall posture, coverage across categories, the "
+    "balance of Compliant vs Under Review vs Non-Compliant files, and the most "
+    "important risks. "
+    "Highlight: coverage gaps, low scores, Non-Compliant files, plans without "
     "steps or attachments, missing analysis. "
     "Do NOT give legal advice or recommend actions outside continuity management."
 )
@@ -136,12 +146,12 @@ _SYSTEM = (
 
 async def _llm_summary(
     *,
-    totals: dict,
-    integrity: dict,
-    counts: dict,
+    totals: dict[str, Any],
+    integrity: dict[str, Any],
+    counts: dict[str, Any],
     average_score: int,
-    sample: list[dict],
-    log_call=None,
+    sample: list[dict[str, Any]],
+    log_call: _LogCall = None,
 ) -> tuple[str, list[str]]:
     """Call the LLM to produce summary + findings."""
     payload = {
@@ -149,7 +159,7 @@ async def _llm_summary(
         "averageScore":       average_score,
         "categoryCounts":     counts,
         "integrityBreakdown": integrity,
-        "sampleDocs":         sample[:25],   # capped — this is the bounded reduce
+        "sampleDocs":         sample,   # full list from caller; capped or unlimited
     }
 
     import json
@@ -159,15 +169,15 @@ async def _llm_summary(
             {"role": "user",   "content": json.dumps(payload)},
         ],
         fallback={"summary": "", "findings": []},
-        max_tokens=420,
+        max_tokens=1500,   # raised to handle larger sample lists
         log_call=log_call,
     )
 
-    raw_summary = str(result.get("summary", "")).strip()[:360]
+    raw_summary = str(result.get("summary", "")).strip()[:1500]
     raw_findings = result.get("findings", [])
     if not isinstance(raw_findings, list):
         raw_findings = []
-    findings = [str(f).strip()[:140] for f in raw_findings if str(f).strip()][:4]
+    findings = [str(f).strip()[:350] for f in raw_findings if str(f).strip()][:8]
 
     if not raw_summary:
         raw_summary, findings = _fallback_text(totals, "")
@@ -189,4 +199,4 @@ def _fallback_text(totals: dict, posture: str) -> tuple[str, list[str]]:
         f"and {attachments} attachment{'s' if attachments != 1 else ''}. "
         "Configure OPENAI_API_KEY for a tailored audit."
     )
-    return summary[:360], []
+    return summary[:1500], []

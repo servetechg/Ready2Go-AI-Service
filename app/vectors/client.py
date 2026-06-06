@@ -5,7 +5,7 @@ get_client():
   Subsequent calls return the same cached instance.
 
 ensure_collections():
-  Creates DocChunk and CategoryPrototype collections if they don't exist yet.
+  Creates the DocChunk collection if it doesn't exist yet.
   Safe to call on every startup — it's idempotent.
 
 Both functions are sync; Weaviate v4's HTTP client is sync-friendly and the
@@ -18,13 +18,12 @@ from __future__ import annotations
 import logging
 
 import weaviate
+import weaviate.classes.config as wvc
 
 from app.config import get_settings
 from app.vectors.schema import (
-    CATEGORY_PROTOTYPE_COLLECTION,
     DOC_CHUNK_COLLECTION,
-    category_prototype_collection_config,
-    doc_chunk_collection_config,
+    doc_chunk_properties,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,18 +57,39 @@ def get_client() -> weaviate.WeaviateClient:
     return _client
 
 
+def close_client() -> None:
+    """Close the Weaviate client (call during shutdown)."""
+    global _client
+    if _client is not None:
+        try:
+            _client.close()
+        except Exception as exc:
+            logger.debug(
+                "weaviate.close_failed detail=%s error=%s",
+                "Closing the Weaviate client raised during shutdown; the reference is "
+                "dropped anyway so the process can exit cleanly.",
+                exc,
+            )
+        finally:
+            _client = None
+        logger.info("weaviate.disconnected")
+
+
 def ensure_collections() -> None:
-    """Create DocChunk and CategoryPrototype collections if absent (idempotent)."""
+    """Create the DocChunk collection if absent (idempotent)."""
     client = get_client()
-    existing = {c.name for c in client.collections.list_all(simple=True).values()}  # type: ignore[arg-type]
+    # list_all() returns dict[name, CollectionConfig]; keys are collection names.
+    existing = set(client.collections.list_all(simple=True).keys())
 
     if DOC_CHUNK_COLLECTION not in existing:
-        client.collections.create_from_config(doc_chunk_collection_config())
+        client.collections.create(
+            name=DOC_CHUNK_COLLECTION,
+            properties=doc_chunk_properties(),
+            # No Weaviate vectorizer — we supply OpenAI vectors ourselves.
+            vectorizer_config=wvc.Configure.Vectorizer.none(),
+            multi_tenancy_config=wvc.Configure.multi_tenancy(enabled=True),
+        )
         logger.info("weaviate.collection_created name=%s", DOC_CHUNK_COLLECTION)
-
-    if CATEGORY_PROTOTYPE_COLLECTION not in existing:
-        client.collections.create_from_config(category_prototype_collection_config())
-        logger.info("weaviate.collection_created name=%s", CATEGORY_PROTOTYPE_COLLECTION)
 
 
 # ---------------------------------------------------------------------------

@@ -13,3 +13,7 @@ __pycache__/
 .vscode/
 tests/
 *.md
+# README.md is referenced by pyproject.toml's `readme` field — hatchling needs
+# it to build the project package, so it must stay in the build context.
+!README.md
+docs/
