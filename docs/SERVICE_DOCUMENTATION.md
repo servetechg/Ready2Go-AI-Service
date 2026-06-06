@@ -145,8 +145,9 @@ document into smaller, overlapping pieces called chunks** and embed each piece s
 2. A sliding window of **500 tokens** (`CHUNK_TOKENS`) moves across the text.
 3. Each step advances by **450 tokens** (`500 − 50`), so consecutive chunks **share 50 tokens**
    (`OVERLAP_TOKENS`) of context.
-4. Production stops at **`max_chunks_per_doc` = 200** chunks; any tail beyond that is discarded
-   (this caps embedding cost for very large documents).
+4. The number of chunks is bounded by **`MAX_CHUNKS_PER_DOC`**: a positive value (default `200`)
+   discards the tail beyond that count to cap embedding cost; **`0` means unlimited** — the whole
+   document is chunked regardless of size (the current `.env` uses `0` for complete coverage).
 
 ```
 Full document tokens:  [t0 t1 t2 ............................ t1399]
@@ -187,7 +188,7 @@ answer two completely different questions.**
 |---|---|---|
 | Question it answers | "What does this document **mean**, and how similar is it to other things?" | "Have I **already processed** this exact file, and what are the running totals?" |
 | Stores | Chunk **vectors** (1536 numbers each) + chunk text + metadata | Final **verdicts** (score/status/summary), rolling **counters**, AI **call log** |
-| Query style | Nearest‑neighbour / similarity search, hybrid keyword+vector search | Exact key lookup, `$inc` counter updates, time‑sorted reads |
+| Query style | Nearest‑neighbour / vector similarity search + paginated fetch-by-id | Exact key lookup, `$inc` counter updates, time‑sorted reads |
 | Without it | No semantic scoring at all — can't tell a cyber doc from an earthquake doc | No caching (re‑pay OpenAI every time), no O(1) audit, no cost trail |
 
 ### "If MongoDB already caches the result, why have a vector DB at all?"
@@ -236,9 +237,9 @@ This is what happens when Next.js calls `POST /v1/integrity/analyze`. The orches
  3. Cache check (contentHash, modelVersion)
         └─ HIT  → return cached verdict immediately (0 tokens) ──► DONE
         └─ MISS → continue
- ── steps 4–11 run inside a 25s timeout + catch-all guard ──
+ ── steps 4–11 run inside a REQUEST_TIMEOUT_S timeout + catch-all guard ──
  4. Extract text + quality                (ingest/extract.py)
- 5. Chunk text into ≤200 overlapping chunks (ingest/chunk.py)
+ 5. Chunk text into overlapping chunks    (ingest/chunk.py; MAX_CHUNKS_PER_DOC, 0=unlimited)
  6. Embed all chunks in ONE batched call  (llm/embeddings.py → OpenAI)
  7. Upsert chunks+vectors into Weaviate   (vectors/repo.py, DocChunk)
  8. Compute 4 signals → composite score   (scoring/*)
@@ -256,8 +257,8 @@ This is what happens when Next.js calls `POST /v1/integrity/analyze`. The orches
   nothing. (Note: a cache‑hit response returns the stored component scores but an **empty**
   `similarFiles` list — siblings are only computed on a full run.)
 
-- **Timeout + graceful fallback.** Steps 4–11 run inside `asyncio.wait_for(..., timeout=25s)`
-  (`request_timeout_s`). On **timeout** or any **unexpected exception**, the service does **not**
+- **Timeout + graceful fallback.** Steps 4–11 run inside `asyncio.wait_for(..., timeout=request_timeout_s)`
+  (set by `REQUEST_TIMEOUT_S`, default 25s). On **timeout** or any **unexpected exception**, the service does **not**
   return a 500. Instead it returns a safe fallback: `status="Under Review"`, `score=50`,
   `summary="Analysis unavailable — will retry on next request."`, `degraded=true`. Next.js can
   show the document as "still being reviewed" rather than erroring.
@@ -348,9 +349,14 @@ re‑scan documents — it reads the **rolling counters** already accumulated in
   in `ai_audit_state`), so the auditor reasons about real content, not just scores. The sample is the
   worst‑scoring docs (size set by `AUDIT_SAMPLE_CAP`; `0` = the whole corpus). Falls back to a
   deterministic message if no key/plans.
-- **Always graceful:** if the rolling‑state read or the LLM reduce fails, the endpoint **does not
+- **Fallback sample (`AUDIT_FALLBACK_CAP`).** When `AUDIT_SAMPLE_CAP=0` and the full-corpus call
+  doesn't yield an AI narrative (typically the payload exceeds the model's context window), the
+  audit automatically retries with only the worst‑`AUDIT_FALLBACK_CAP` (default 50) documents and
+  returns the result with **`degraded: true`** so the caller knows a reduced set was used.
+- **Always graceful:** if the rolling‑state read or the LLM reduce raises, the endpoint **does not
   500** — it logs the cause and returns a deterministic fallback built from the request payload
-  (reusing `derive_posture`), leaving the audit state "dirty" so the next call retries.
+  (reusing `derive_posture`, also flagged `degraded: true`), leaving the audit state "dirty" so the
+  next call retries.
 
 ---
 
@@ -601,7 +607,8 @@ Top‑level fields:
     "Average integrity score 62 — trending down."
   ],
   "posture": "Steady",
-  "averageScore": 62
+  "averageScore": 62,
+  "degraded": false
 }
 ```
 
@@ -764,7 +771,7 @@ All settings are environment variables, loaded once and cached by `get_settings(
 | `OPENAI_API_KEY` | `""` | Credential for calling OpenAI (embeddings + the summary/judge model). **Without it** the service can't generate vectors or summaries and silently degrades to metadata‑only/fallback behaviour. **Required in production.** This is a billable secret — keep it private. |
 | `OPENAI_EMBED_MODEL` | `text-embedding-3-small` | Which OpenAI model converts text into the 1536‑number meaning vectors. Changing it changes the vector space, so you must re‑embed existing documents (bump `MODEL_VERSION`). Rarely changed. A blank value is auto‑replaced with the default so a stray empty env var can't break OpenAI calls. |
 | `OPENAI_SUMMARY_MODEL` | `gpt-4o-mini` | Which chat model writes the paragraph document summaries and acts as the borderline "LLM judge". `gpt-4o-mini` is chosen for being cheap and fast. Swap for a stronger model if you want richer summaries at higher cost. Blank → default. |
-| `WEAVIATE_URL` | `""` | Address of the vector database. **Without it** there is no semantic scoring at all (content/category/duplication/name signals can't run). **Required in production.** In Docker dev this is set to `http://weaviate:8080`. |
+| `WEAVIATE_URL` | `""` | Address of the vector database. **Without it** the content signal can't run (no stored centroid) and duplication can't be verified, so scoring is heavily degraded. (The name signal still works — it's an in-process embedding cosine — as does quality.) **Required in production.** In Docker dev this is set to `http://weaviate:8080`. |
 | `WEAVIATE_API_KEY` | `""` | Auth key for a secured/managed Weaviate. Leave empty for the local anonymous dev instance; set it for a hosted production cluster. |
 | `MONGODB_URI` | `""` | Connection string to MongoDB (Atlas). **Without it** the cache, rolling audit counters, and call log don't work — every request would re‑pay OpenAI and the audit endpoint would be empty. **Required in production.** Contains credentials — keep it secret. |
 | `MONGODB_DB` | `ready2go` | Which database inside the cluster to use. It's **shared** with the Next.js app; this service only touches its own `ai_*` collections. Change only if you intentionally isolate environments by database name. |
