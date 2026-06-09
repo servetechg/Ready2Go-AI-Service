@@ -74,6 +74,27 @@ Stored in the Docker named volume `weaviate_data` (mounted at
 Only `down -v` erases vectors. Mongo `ai_*` data is on Atlas and is never
 touched by Docker.
 
+### Storing the vector data somewhere else (another drive / NFS / cloud mount)
+
+Set **`WEAVIATE_DATA_PATH`** in `.env` to an absolute host path. Compose then bind‑mounts
+that directory instead of the named volume — so the entire vector store (vectors + text +
+metadata) lives wherever you point it:
+
+```bash
+WEAVIATE_DATA_PATH=/mnt/bigdisk/r2g/weaviate   # in .env, then:
+docker compose up -d
+```
+
+Leave it unset to keep the default named `weaviate_data` volume. For a fully managed/cloud
+Weaviate, don't run the local `weaviate` service at all — set `WEAVIATE_URL` (and
+`WEAVIATE_API_KEY`, `WEAVIATE_GRPC_PORT`) to the managed endpoint.
+
+### Turning file logs off / relocating them
+
+- `LOG_TO_FILE=false` → the service logs to the console only (nothing written to disk).
+- `LOG_DIR=/mnt/bigdisk/r2g/logs` (or set `DATA_DIR` to move logs **and** the default
+  Weaviate path together) → relocate the `app.log` / `error.log` files.
+
 ---
 
 ## Step-by-step
@@ -171,14 +192,112 @@ docker compose down -v      # ALSO wipe Weaviate data (fresh start)
 
 ## How the pieces connect
 
-- **Ports**: `"8000:8000"` maps `localhost:8000` (your laptop) → port 8000
-  inside the `api` container. Same idea for Weaviate's `8080` and `50051`.
+- **Everything is env-driven**: `docker-compose.yml` uses `${VAR:-default}`
+  interpolation — `API_PORT`, `WEAVIATE_IMAGE`, `WEAVIATE_HTTP_PORT`,
+  `WEAVIATE_GRPC_PORT`, `WEAVIATE_QUERY_DEFAULTS_LIMIT`, `WEAVIATE_DATA_PATH`,
+  `WEAVIATE_INTERNAL_URL`, `RELOAD`. Nothing infra-relevant is hardcoded; set any
+  of these in `.env` to change it.
+- **Ports**: `"${API_PORT:-8000}:${PORT:-8000}"` maps host `API_PORT` → the app's
+  `PORT` inside the `api` container. Same idea for Weaviate's HTTP/gRPC ports.
 - **Service names as hostnames**: containers reach each other by service name on
-  Compose's private network. That's why `WEAVIATE_URL=http://weaviate:8080`
-  (not `localhost` — inside a container `localhost` means that container itself).
+  Compose's private network. That's why the API's in-network URL is
+  `WEAVIATE_INTERNAL_URL` (default `http://weaviate:8080`) — not `localhost`,
+  which inside a container means that container itself.
 - **Config**: `env_file: .env` loads all vars (incl. Atlas `MONGODB_URI`); the
-  `environment:` block overrides only container-specific ones (`WEAVIATE_URL`,
-  `RELOAD`).
+  `environment:` block sets the container-specific in-network values
+  (`WEAVIATE_URL` from `WEAVIATE_INTERNAL_URL`, `RELOAD`, `LOG_DIR=/app/logs`).
+- **Runs as you**: the `api` service sets `user: ${HOST_UID:-1000}:${HOST_GID:-1000}`
+  so files written to bind mounts (`./logs`) are owned by your host user, not the
+  image's UID-999 `app` user. See the UID gotcha below if `id` shows non-1000.
+- **Persistence on the host**: `./logs` → `/app/logs` and `WEAVIATE_DATA_PATH` →
+  `/var/lib/weaviate` are bind-mounted, so logs and vectors live on your disk and
+  survive container removal. Weaviate pins `CLUSTER_HOSTNAME=node1` so its RAFT
+  state stays valid across `compose up`/`down` (see the gotcha below).
+
+---
+
+## First-run gotchas (and why they happen)
+
+These bit us on the first dockerized run. All are already fixed in the current
+`docker-compose.yml` / host config — this section explains the reasoning so you can
+fix them again on a fresh machine.
+
+### Build can't pull images — `dial tcp: lookup ghcr.io on 127.0.0.53:53: i/o timeout`
+
+The Docker daemon resolves image names (`docker/dockerfile:1`, `python:3.12-slim`,
+`ghcr.io/astral-sh/uv`) via the **host's** `/etc/resolv.conf`, which on Ubuntu points
+at the systemd-resolved stub `127.0.0.53` → your router. If the router's DNS is flaky,
+pulls time out intermittently (works once, fails the next).
+
+> ⚠️ Setting `"dns"` in `/etc/docker/daemon.json` does **not** fix this — that only
+> gives DNS to *running containers*, not to the daemon's own image pulls.
+
+Fix the **host resolver** so the stub has a reliable upstream:
+
+```bash
+sudo mkdir -p /etc/systemd/resolved.conf.d
+sudo bash -c 'printf "[Resolve]\nDNS=8.8.8.8 8.8.4.4\nFallbackDNS=1.1.1.1\n" > /etc/systemd/resolved.conf.d/dns.conf'
+sudo systemctl restart systemd-resolved
+resolvectl status | grep "Current DNS"   # should now show 8.8.8.8
+```
+
+### `PermissionError: '/app/logs/app.log'` — UID mismatch on the log bind mount
+
+The image's `app` user is **UID 999**; your host user is **UID 1000**. With `./logs`
+bind-mounted, files written by one can't be written by the other. The compose `api`
+service therefore runs as the **host user**:
+
+```yaml
+user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+```
+
+The default `1000:1000` is the typical first Linux user. If `id` shows different
+numbers, either set `HOST_UID`/`HOST_GID` in `.env` or run:
+
+```bash
+HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose up -d
+```
+
+This keeps log files owned by you, so `docker compose` and local `uv run main` can
+share the same `./logs` folder without clashing.
+
+### Weaviate: `403 ... leader not found`, logs loop on "attempting to join"
+
+Weaviate 1.25+ runs an internal RAFT consensus layer. By default it keys its node
+identity to the **container's IP** (`172.18.0.x`), which changes on every
+`compose up`. With a persistent data path, the saved raft state then references an
+IP that no longer exists → the node never elects a leader → every schema call 403s.
+
+Fixed by pinning a **stable node identity** in the `weaviate` service:
+
+```yaml
+CLUSTER_HOSTNAME: "node1"
+RAFT_BOOTSTRAP_EXPECT: "1"
+```
+
+If you hit this **after** raft state was already written with the old (IP-keyed)
+identity, you must clear it once. The `raft` dir is created by root, so wipe it via a
+root container (no host `sudo` needed):
+
+```bash
+docker compose down
+docker run --rm -v "${WEAVIATE_DATA_PATH:-/home/mehmood/data/weaviate}":/data alpine \
+  sh -c 'rm -rf /data/* /data/.[!.]*'
+docker compose up -d        # watch for: "raft election won" → schema returns 200
+```
+
+> This wipes vectors too — only safe on a fresh/empty store. Once `CLUSTER_HOSTNAME`
+> is set, normal `up`/`down` cycles keep the data and the error won't recur.
+
+### Bind-mount directories must exist and be writable
+
+Create the host dirs and make them writable before first run (the Weaviate container
+writes as root; the api container as your UID):
+
+```bash
+mkdir -p /home/mehmood/data/weaviate ./logs
+chmod 777 /home/mehmood/data/weaviate ./logs
+```
 
 ---
 
@@ -187,6 +306,9 @@ docker compose down -v      # ALSO wipe Weaviate data (fresh start)
 | Symptom                                   | Cause / fix                                                        |
 | ----------------------------------------- | ----------------------------------------------------------------- |
 | Build fails: `Readme file does not exist` | `README.md` excluded by `.dockerignore` — keep the `!README.md` line |
+| Build fails: `lookup ... on 127.0.0.53: i/o timeout` | Host DNS flaky — see "Build can't pull images" above   |
+| `PermissionError: '/app/logs/app.log'`    | UID mismatch — set `HOST_UID`/`HOST_GID` (see gotchas above)       |
+| Weaviate `403 leader not found` / join loop | Stale RAFT state — clear data dir, keep `CLUSTER_HOSTNAME` (above) |
 | `/readyz` shows weaviate "degraded"       | Weaviate container not up yet — `docker compose ps`, wait, retry   |
 | `/readyz` shows mongodb "degraded"        | Atlas unreachable / bad `MONGODB_URI` in `.env`                    |
 | Port 8000 already in use                  | A local `uv run main` is running — stop it (don't run both)        |

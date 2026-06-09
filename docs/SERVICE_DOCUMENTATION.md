@@ -688,12 +688,12 @@ EdDSA) tokens validated against a JWKS endpoint, used **in addition to** TLS and
 
 | Data | System | Physical location | Survives restart? | Tenant‑isolated? |
 |------|--------|-------------------|-------------------|------------------|
-| **Document chunks + vectors** | Weaviate | Docker named volume `weaviate_data` mounted at `/var/lib/weaviate` (LSM store + HNSW vector index + BM25 inverted index + WAL) | ✅ survives `docker compose down`; **deleted** only by `down -v` | ✅ `DocChunk` is multi‑tenant (`sub_<ownerUserId>`) |
+| **Document chunks + vectors** | Weaviate | `/var/lib/weaviate` inside the container; on the host it's the named `weaviate_data` volume, or any path you set via **`WEAVIATE_DATA_PATH`** (bind mount onto another drive / NFS / cloud) | ✅ survives `docker compose down`; **deleted** only by `down -v` | ✅ `DocChunk` is multi‑tenant (`sub_<ownerUserId>`) |
 | **Result cache** | MongoDB Atlas | `ready2go.ai_analysis_cache` | ✅ (Atlas‑managed, backed up) | by content hash (tenant‑agnostic) |
 | **Rolling audit state** | MongoDB Atlas | `ready2go.ai_audit_state` (`_id = tenantKey`) | ✅ | ✅ one doc per tenant |
 | **AI call log** | MongoDB Atlas | `ready2go.ai_call_log` | ✅ | appended (carries `attachmentId`) |
-| **App logs (all levels)** | Filesystem | `logs/app.log` (JSON, rotating 10 MB × 5) | ⚠️ **ephemeral in container** — lost on restart unless a volume is mounted | n/a |
-| **Error logs (WARNING+)** | Filesystem | `logs/error.log` (JSON, rotating 10 MB × 5) | ⚠️ ephemeral in container | n/a |
+| **App logs (all levels)** | Filesystem | `${LOG_DIR}/app.log` (default `${DATA_DIR}/logs`; JSON, rotating 10 MB × 5). Disabled entirely by `LOG_TO_FILE=false` | ⚠️ **ephemeral in container** unless `LOG_DIR`/`DATA_DIR` points at a mounted path | n/a |
+| **Error logs (WARNING+)** | Filesystem | `${LOG_DIR}/error.log` (same controls as above) | ⚠️ ephemeral in container unless mounted | n/a |
 
 ### Docker topology — `docker-compose.yml`
 - **`api`** — this service, port `8000`, env from `.env`, overrides `WEAVIATE_URL=http://weaviate:8080`,
@@ -714,9 +714,10 @@ EdDSA) tokens validated against a JWKS endpoint, used **in addition to** TLS and
 
 Configured in [app/logging.py](../app/logging.py) via **structlog** bridged into stdlib logging.
 
-- **Three sinks:** console (pretty in dev, JSON in prod), `logs/app.log` (all levels, JSON,
-  rotating), `logs/error.log` (WARNING+, JSON, rotating). Rotation: `log_max_bytes` (10 MB) ×
-  `log_backups` (5).
+- **Sinks:** the **console** sink is always on (pretty in dev, JSON in prod). When
+  `LOG_TO_FILE=true` (default) two **rotating file** sinks are added under `LOG_DIR`
+  (default `${DATA_DIR}/logs`): `app.log` (all levels, JSON) and `error.log` (WARNING+, JSON).
+  Rotation: `log_max_bytes` (10 MB) × `log_backups` (5). Set `LOG_TO_FILE=false` for console-only.
 - **Request correlation:** [app/middleware.py](../app/middleware.py) `CorrelationMiddleware`
   assigns each request a UUID `request_id`, binds it into structlog contextvars (so *every* log
   line in that request carries it), logs `http.request`/`http.response` with latency, and returns
@@ -763,7 +764,9 @@ All settings are environment variables, loaded once and cached by `get_settings(
 | `LOG_LEVEL` | `INFO` | How chatty the logs are: `DEBUG` (everything, noisy), `INFO` (normal), `WARNING`/`ERROR` (problems only). Use `DEBUG` when diagnosing an issue, `INFO` in normal operation. |
 | `RELOAD` | `false` | Auto‑restart the server when source files change. Handy while coding locally; **always `false` in containers/production** (it wastes resources and isn't safe under load). |
 | `REQUEST_TIMEOUT_S` | `25.0` | The maximum seconds the analyze pipeline (download → embed → score → summarise) may run before it gives up and returns the safe "Under Review/50/degraded" fallback. **Raise it** if large PDFs legitimately need more time; **lower it** if you'd rather fail fast. Too low → healthy documents wrongly fall back; too high → slow requests hold connections open. |
-| `LOG_DIR` | `logs` | Folder where the rotating log files (`app.log`, `error.log`) are written. Point it at a mounted volume if you want logs to survive container restarts. |
+| `DATA_DIR` | `.` | Base directory for everything the service persists. Each path below defaults to a sub-folder of it but can be overridden individually. Set it to a mounted volume (e.g. `/data`, another drive, NFS, or a cloud-fs mount) to relocate all persisted artifacts at once. |
+| `LOG_DIR` | `${DATA_DIR}/logs` | Folder for the rotating log files (`app.log`, `error.log`). Defaults under `DATA_DIR`; set an absolute path here to send **only** logs somewhere else (overrides the DATA_DIR default). |
+| `LOG_TO_FILE` | `true` | Master on/off for writing log files. `false` → console-only logging, nothing written to disk (useful when a log shipper already captures stdout, or for read-only filesystems). The console sink is always on. |
 | `LOG_MAX_BYTES` | `10485760` (10 MB) | How big a single log file may grow before it's "rotated" (renamed and a fresh one started). Prevents one giant unbounded log file from filling the disk. |
 | `LOG_BACKUPS` | `5` | How many rotated old log files to keep before the oldest is deleted. With the defaults you keep ~50 MB of history per log. Increase for longer retention. |
 | `PYTHON_INTEGRITY_TOKEN` | `""` | The **shared password** the Next.js app must send as `Authorization: Bearer <token>`. This is the primary auth gate. **In production it is mandatory** — empty means the service rejects everything (fail‑closed). In dev, leaving it empty disables auth for convenience. Rotate it by updating this value on both this service and Next.js. |
@@ -773,6 +776,9 @@ All settings are environment variables, loaded once and cached by `get_settings(
 | `OPENAI_SUMMARY_MODEL` | `gpt-4o-mini` | Which chat model writes the paragraph document summaries and acts as the borderline "LLM judge". `gpt-4o-mini` is chosen for being cheap and fast. Swap for a stronger model if you want richer summaries at higher cost. Blank → default. |
 | `WEAVIATE_URL` | `""` | Address of the vector database. **Without it** the content signal can't run (no stored centroid) and duplication can't be verified, so scoring is heavily degraded. (The name signal still works — it's an in-process embedding cosine — as does quality.) **Required in production.** In Docker dev this is set to `http://weaviate:8080`. |
 | `WEAVIATE_API_KEY` | `""` | Auth key for a secured/managed Weaviate. Leave empty for the local anonymous dev instance; set it for a hosted production cluster. |
+| `WEAVIATE_GRPC_PORT` | `50051` | gRPC port the Weaviate v4 client dials. Inside the compose stack keep it at the container's internal port; change it only when pointing at a managed/cloud Weaviate that exposes gRPC on a different port. |
+| `WEAVIATE_HTTP_PORT` | _(unset)_ | Optional override for the HTTP port (otherwise parsed from `WEAVIATE_URL`). |
+| **Docker/compose infra** | — | Read only by `docker-compose.yml` (not the app): `API_PORT` (host-published API port), `WEAVIATE_INTERNAL_URL` (URL the API uses inside the compose network), `WEAVIATE_IMAGE` (image + version), `WEAVIATE_HTTP_PORT`/`WEAVIATE_GRPC_PORT` (Weaviate published ports), `WEAVIATE_QUERY_DEFAULTS_LIMIT`, and **`WEAVIATE_DATA_PATH`** — an absolute host path for the Weaviate vector data (bind mount onto another drive / NFS / cloud mount; default = the named `weaviate_data` volume). |
 | `MONGODB_URI` | `""` | Connection string to MongoDB (Atlas). **Without it** the cache, rolling audit counters, and call log don't work — every request would re‑pay OpenAI and the audit endpoint would be empty. **Required in production.** Contains credentials — keep it secret. |
 | `MONGODB_DB` | `ready2go` | Which database inside the cluster to use. It's **shared** with the Next.js app; this service only touches its own `ai_*` collections. Change only if you intentionally isolate environments by database name. |
 | `MODEL_VERSION` | `integrity-v1` | A label stamped onto every result and used as part of the cache key. **This is your "cache reset" lever:** bump it (e.g. `integrity-v2`) whenever you change the embedding model, scoring logic, or prompts so old cached verdicts are ignored and documents get re‑analysed. |

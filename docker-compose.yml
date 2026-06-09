@@ -4,43 +4,70 @@
 # by MONGODB_URI in .env (the same `ready2go` DB the Next.js app uses). Python
 # keeps its own `ai_*` collections inside that DB; it never writes app domain docs.
 # Weaviate is self-hosted here for dev; production points at a managed equivalent.
+#
+# Everything below is driven by .env via ${VAR:-default} interpolation — nothing
+# infra-relevant is hardcoded. Override any of these in .env to retarget ports,
+# the Weaviate image, the internal URL, or where the vector data is stored.
 
 services:
   api:
     build: .
+    # Run as the HOST user so files written to bind mounts (logs) are owned by
+    # you, not the image's UID-999 `app` user. Avoids permission clashes between
+    # `docker compose` and local `uv run main` on the same ./logs folder.
+    # Defaults to 1000:1000 (typical first Linux user); override in .env if `id`
+    # shows different. Override at run time: HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose up
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     ports:
-      - "8000:8000"
+      # host:container — host is API_PORT, container is the app's PORT.
+      - "${API_PORT:-8000}:${PORT:-8000}"
     env_file:
       - .env
     environment:
       # MONGODB_URI / MONGODB_DB come from .env (Atlas).
-      # Only override what's container-specific:
-      WEAVIATE_URL: http://weaviate:8080
-      # No file-watch reload inside the container.
-      RELOAD: "false"
+      # Container-specific override: inside the compose network the API reaches
+      # Weaviate by its service name, not localhost.
+      WEAVIATE_URL: "${WEAVIATE_INTERNAL_URL:-http://weaviate:8080}"
+      # No file-watch reload inside the container by default.
+      RELOAD: "${RELOAD:-false}"
+      # Always write logs to /app/logs inside the container (bound to LOG_DIR on host).
+      LOG_DIR: /app/logs
+    volumes:
+      # Persist log files onto the HOST so they survive container restarts/removal.
+      # Set LOG_DIR in .env to any host path (default ./logs); inside the container
+      # logs always go to /app/logs which is bind-mounted to that host path.
+      - "${LOG_DIR:-./logs}:/app/logs"
     depends_on:
       weaviate:
         condition: service_started
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=3).status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:${PORT:-8000}/healthz', timeout=3).status==200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
 
   weaviate:
-    image: cr.weaviate.io/semitechnologies/weaviate:1.27.0
+    image: "${WEAVIATE_IMAGE:-cr.weaviate.io/semitechnologies/weaviate:1.27.0}"
     ports:
-      - "8080:8080"
-      - "50051:50051"
+      - "${WEAVIATE_HTTP_PORT:-8080}:8080"
+      - "${WEAVIATE_GRPC_PORT:-50051}:50051"
     environment:
-      QUERY_DEFAULTS_LIMIT: 25
+      QUERY_DEFAULTS_LIMIT: "${WEAVIATE_QUERY_DEFAULTS_LIMIT:-25}"
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
       PERSISTENCE_DATA_PATH: /var/lib/weaviate
       DEFAULT_VECTORIZER_MODULE: none
       ENABLE_MODULES: ""
+      # Pin a STABLE single-node identity. Without this Weaviate keys its RAFT
+      # state to the container's ephemeral IP, so every `compose up` recreate
+      # makes it try to re-join a node that no longer exists → "leader not found".
+      # A fixed hostname keeps the persisted raft state valid across restarts.
+      CLUSTER_HOSTNAME: "node1"
+      RAFT_BOOTSTRAP_EXPECT: "1"
     volumes:
-      - weaviate_data:/var/lib/weaviate
+      # WEAVIATE_DATA_PATH can be an absolute host path (another drive / NFS / cloud
+      # mount) → bind mount; the default keeps the named `weaviate_data` volume.
+      - "${WEAVIATE_DATA_PATH:-weaviate_data}:/var/lib/weaviate"
 
 volumes:
   weaviate_data:

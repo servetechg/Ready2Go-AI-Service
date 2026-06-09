@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 
+# Base image is overridable at build time: --build-arg PYTHON_VERSION=3.12-slim
+ARG PYTHON_VERSION=3.12-slim
+
 # ---- Builder: resolve + install deps into a venv with uv -------------------
-FROM python:3.12-slim AS builder
+FROM python:${PYTHON_VERSION} AS builder
 
 # Bring in the uv binary.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -23,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 # ---- Runtime: slim image with just the venv + app --------------------------
-FROM python:3.12-slim AS runtime
+FROM python:${PYTHON_VERSION} AS runtime
 
 RUN groupadd --system app && useradd --system --gid app --create-home app
 WORKDIR /app

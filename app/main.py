@@ -27,7 +27,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging(
         settings.log_level,
         json_logs=settings.is_production,
-        log_dir=settings.log_dir,
+        log_dir=settings.log_dir or "logs",
+        log_to_file=settings.log_to_file,
         log_max_bytes=settings.log_max_bytes,
         log_backups=settings.log_backups,
     )

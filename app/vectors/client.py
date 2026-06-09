@@ -44,12 +44,16 @@ def get_client() -> weaviate.WeaviateClient:
         if settings.weaviate_api_key:
             additional_headers["X-Weaviate-Api-Key"] = settings.weaviate_api_key
 
+        # HTTP port: explicit override (WEAVIATE_HTTP_PORT) else parsed from the URL.
+        # gRPC port: WEAVIATE_GRPC_PORT (default 50051) — configurable for managed/
+        # cloud Weaviate which may expose gRPC on a non-default port.
+        http_port = settings.weaviate_http_port or _port(settings.weaviate_url)
         _client = weaviate.connect_to_custom(
             http_host=_host(settings.weaviate_url),
-            http_port=_port(settings.weaviate_url),
+            http_port=http_port,
             http_secure=settings.weaviate_url.startswith("https"),
             grpc_host=_host(settings.weaviate_url),
-            grpc_port=50051,
+            grpc_port=settings.weaviate_grpc_port,
             grpc_secure=settings.weaviate_url.startswith("https"),
             headers=additional_headers,
         )

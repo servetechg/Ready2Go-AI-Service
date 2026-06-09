@@ -27,13 +27,20 @@ def configure_logging(
     *,
     json_logs: bool = False,
     log_dir: str = "logs",
+    log_to_file: bool = True,
     log_max_bytes: int = 10 * 1024 * 1024,
     log_backups: int = 5,
 ) -> None:
-    """Configure stdlib logging + structlog with console + rotating file sinks."""
+    """Configure stdlib logging + structlog.
+
+    The console sink is always on. When *log_to_file* is True, two rotating file
+    sinks are also added (``app.log`` all-levels and ``error.log`` WARNING+);
+    when False, logging is console-only and nothing is written to disk.
+    """
     numeric_level = getattr(logging, level.upper(), logging.INFO)
 
-    os.makedirs(log_dir, exist_ok=True)
+    if log_to_file:
+        os.makedirs(log_dir, exist_ok=True)
 
     # Shared structlog pre-processors (run before the final renderer).
     shared_processors: list[structlog.types.Processor] = [
@@ -60,32 +67,37 @@ def configure_logging(
     for h in root.handlers[:]:
         root.removeHandler(h)
 
-    # Console handler.
+    # Console handler (always on).
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(numeric_level)
     root.addHandler(console_handler)
 
-    # Rotating app.log — all levels, JSON lines.
-    app_log_path = os.path.join(log_dir, "app.log")
-    file_handler = logging.handlers.RotatingFileHandler(
-        app_log_path,
-        maxBytes=log_max_bytes,
-        backupCount=log_backups,
-        encoding="utf-8",
-    )
-    file_handler.setLevel(numeric_level)
-    root.addHandler(file_handler)
+    # Rotating file sinks — only when LOG_TO_FILE is enabled.
+    file_handlers: list[logging.Handler] = []
+    if log_to_file:
+        # Rotating app.log — all levels, JSON lines.
+        app_log_path = os.path.join(log_dir, "app.log")
+        file_handler = logging.handlers.RotatingFileHandler(
+            app_log_path,
+            maxBytes=log_max_bytes,
+            backupCount=log_backups,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(numeric_level)
+        root.addHandler(file_handler)
+        file_handlers.append(file_handler)
 
-    # Rotating error.log — WARNING+ only for fast triage.
-    error_log_path = os.path.join(log_dir, "error.log")
-    error_handler = logging.handlers.RotatingFileHandler(
-        error_log_path,
-        maxBytes=log_max_bytes,
-        backupCount=log_backups,
-        encoding="utf-8",
-    )
-    error_handler.setLevel(logging.WARNING)
-    root.addHandler(error_handler)
+        # Rotating error.log — WARNING+ only for fast triage.
+        error_log_path = os.path.join(log_dir, "error.log")
+        error_handler = logging.handlers.RotatingFileHandler(
+            error_log_path,
+            maxBytes=log_max_bytes,
+            backupCount=log_backups,
+            encoding="utf-8",
+        )
+        error_handler.setLevel(logging.WARNING)
+        root.addHandler(error_handler)
+        file_handlers.append(error_handler)
 
     # ---------------------------------------------------------------------------
     # structlog — routes through stdlib so every handler above receives events.
@@ -101,7 +113,7 @@ def configure_logging(
         cache_logger_on_first_use=True,
     )
 
-    # The ProcessorFormatter drives the final render for every stdlib handler.
+    # The ProcessorFormatter drives the final render for the file handlers (JSON).
     formatter = structlog.stdlib.ProcessorFormatter(
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
@@ -109,8 +121,8 @@ def configure_logging(
         ],
         foreign_pre_chain=shared_processors,
     )
-    file_handler.setFormatter(formatter)
-    error_handler.setFormatter(formatter)
+    for handler in file_handlers:
+        handler.setFormatter(formatter)
 
     # Console uses its own renderer (pretty or JSON per env).
     console_formatter = structlog.stdlib.ProcessorFormatter(

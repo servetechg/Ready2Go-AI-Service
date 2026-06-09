@@ -7,9 +7,10 @@ and safe to call at import time.
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,8 +32,19 @@ class Settings(BaseSettings):
     reload: bool = False
     request_timeout_s: float = 25.0
 
+    # ---- Storage paths & persistence -----------------------------------
+    # DATA_DIR is the base directory for everything this service persists. Each
+    # artifact below defaults to a sub-folder of DATA_DIR but can be overridden
+    # individually to any absolute path (another drive / NFS / cloud mount).
+    # Default "." keeps today's behaviour (logs under ./logs).
+    data_dir: str = "."
+
     # ---- Logging --------------------------------------------------------
-    log_dir: str = "logs"
+    # log_dir defaults to "{data_dir}/logs" (filled by _derive_paths) unless an
+    # explicit LOG_DIR is set, which always wins.
+    log_dir: str | None = None
+    # LOG_TO_FILE=false → console-only logging, no app.log / error.log on disk.
+    log_to_file: bool = True
     log_max_bytes: int = 10 * 1024 * 1024   # 10 MB per file
     log_backups: int = 5
 
@@ -60,6 +72,10 @@ class Settings(BaseSettings):
     # ---- Weaviate (vector store) ---------------------------------------
     weaviate_url: str = ""
     weaviate_api_key: str = ""
+    # gRPC port for the Weaviate v4 client. HTTP port defaults to the one parsed
+    # from WEAVIATE_URL; set weaviate_http_port to override (e.g. managed/cloud).
+    weaviate_grpc_port: int = 50051
+    weaviate_http_port: int | None = None
 
     # ---- MongoDB -------------------------------------------------------
     # ONE database (`mongodb_db`, default "ready2go"), TWO disjoint uses:
@@ -117,6 +133,14 @@ class Settings(BaseSettings):
     # "basic" (default) uses pdfplumber/pypdf/docx/xlsx.
     # Switch to "liteparse" via env when a drop-in LiteParse adapter is added.
     parser_backend: str = "basic"
+
+    @model_validator(mode="after")
+    def _derive_paths(self) -> Settings:
+        # Fill artifact paths from DATA_DIR when not set explicitly. An explicit
+        # LOG_DIR (the per-artifact override) always wins.
+        if not self.log_dir:
+            self.log_dir = os.path.join(self.data_dir, "logs")
+        return self
 
     @property
     def is_production(self) -> bool:
