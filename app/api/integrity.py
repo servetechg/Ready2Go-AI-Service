@@ -40,9 +40,11 @@ from app.ingest.fetch import FetchError, fetch_bytes
 from app.llm.client import chat_json
 from app.llm.embeddings import embed_texts
 from app.schemas import (
+    AnalyzeAccepted,
     AnalyzeDetails,
     AnalyzeRequest,
     AnalyzeResponse,
+    AnalyzeResultEnvelope,
     ComponentScores,
     RescanRequest,
     SimilarFile,
@@ -51,7 +53,7 @@ from app.scoring import integrity as scorer
 from app.scoring import signals as sig
 from app.scoring.integrity import SignalInputs
 from app.security import require_auth
-from app.store import aggregate, cache, calllog
+from app.store import aggregate, cache, calllog, jobs
 from app.summary.per_doc import one_liner
 from app.vectors import repo as vec
 
@@ -69,106 +71,206 @@ log = structlog.get_logger(__name__)
 _FALLBACK_SUMMARY = "Analysis unavailable — will retry on next request."
 
 
-@router.post("/analyze", response_model=AnalyzeResponse)
-async def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
-    """Full integrity analysis pipeline for one attachment."""
+# Caps concurrent heavy pipelines so a burst of large PDFs can't exhaust memory;
+# requests beyond the cap queue on this semaphore. Bound to the running loop and
+# recreated if the loop changes (keeps test isolation across event loops).
+_analyze_semaphore: asyncio.Semaphore | None = None
+_analyze_semaphore_loop: asyncio.AbstractEventLoop | None = None
+
+# Strong references to in-flight background tasks. Without this the event loop only
+# keeps a weak reference and a long pipeline could be garbage-collected mid-run.
+_background_tasks: set[asyncio.Task[None]] = set()
+
+
+def _get_analyze_semaphore() -> asyncio.Semaphore:
+    global _analyze_semaphore, _analyze_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _analyze_semaphore is None or _analyze_semaphore_loop is not loop:
+        _analyze_semaphore = asyncio.Semaphore(get_settings().analyze_concurrency)
+        _analyze_semaphore_loop = loop
+    return _analyze_semaphore
+
+
+@router.post("/analyze", status_code=status.HTTP_202_ACCEPTED, response_model=AnalyzeAccepted)
+async def analyze(payload: AnalyzeRequest) -> AnalyzeAccepted:
+    """Queue an integrity analysis and return immediately (202).
+
+    The full pipeline (fetch → extract → embed → score → summarize) runs in the
+    background so the caller never blocks on slow documents. Poll
+    ``GET /v1/integrity/result/{attachmentId}`` until ``state != "processing"``.
+    """
     settings = get_settings()
     tenant = payload.tenant_context.tenant_key
-    att = payload.attachment
-    attachment_id = att.attachment_id
+    attachment_id = payload.attachment.attachment_id
 
     _require_tenant(tenant)
 
-    # Bind document identifiers into the structlog context so every log line
-    # in this request carries tenant + attachment without extra kwargs.
-    structlog.contextvars.bind_contextvars(
+    # Record the job as processing BEFORE scheduling so an immediate poll sees it.
+    await run_in_threadpool(
+        jobs.start, attachment_id, tenant_key=tenant, model_version=settings.model_version,
+    )
+    task = asyncio.create_task(_background_analyze(payload, settings))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    log.info(
+        "analyze.queued",
+        detail="Analysis queued; pipeline runs in the background. Poll pollUrl for the result.",
         tenant=tenant,
         attachment_id=attachment_id,
     )
-
-    # ------------------------------------------------------------------ #
-    # 2. Fetch bytes + sha256                                              #
-    # ------------------------------------------------------------------ #
-    try:
-        t0 = time.perf_counter()
-        fetch_result = await fetch_bytes(att.file_url)
-        log.info(
-            "pipeline.fetched",
-            bytes=fetch_result.size_bytes,
-            content_hash=fetch_result.content_hash,
-            mime=fetch_result.mime,
-            latency_ms=round((time.perf_counter() - t0) * 1000, 1),
-        )
-    except FetchError as exc:
-        log.error("integrity.fetch_failed", error=str(exc))
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Could not fetch attachment: {exc.reason}",
-        ) from exc
-
-    content_hash = fetch_result.content_hash
-    model_version = settings.model_version
-
-    # ------------------------------------------------------------------ #
-    # 3. Cache check                                                       #
-    # ------------------------------------------------------------------ #
-    cached = await run_in_threadpool(cache.get, content_hash, model_version)
-    if cached:
-        log.info(
-            "pipeline.cache_hit",
-            detail=(
-                "Identical file bytes were analyzed before under this model version; "
-                "returning the cached verdict and spending zero embedding/LLM tokens."
-            ),
-            content_hash=content_hash,
-        )
-        return AnalyzeResponse(
-            status=cached["status"],
-            score=cached["score"],
-            summary=cached["summary"],
-            analyzed_at=datetime.now(UTC),
-            model_version=model_version,
-            details=AnalyzeDetails(
-                component_scores=ComponentScores(**cached.get("scoreComponents", {})),
-                cache_hit=True,
-            ),
-        )
-    log.info(
-        "pipeline.cache_miss",
-        detail=(
-            "No cached verdict for these exact file bytes + model version; running "
-            "the full extract/embed/score/summarize pipeline."
-        ),
-        content_hash=content_hash,
+    return AnalyzeAccepted(
+        attachment_id=attachment_id,
+        poll_url=f"/v1/integrity/result/{attachment_id}",
     )
 
-    # ------------------------------------------------------------------ #
-    # Steps 4-11: run inside a timeout + catch-all guard.                 #
-    # On timeout or unexpected error → graceful Reviewing fallback.       #
-    # ------------------------------------------------------------------ #
-    pipeline_start = time.perf_counter()
-    try:
-        result_response = await asyncio.wait_for(
-            _run_pipeline(payload, fetch_result, settings),
-            timeout=settings.request_timeout_s,
-        )
-        log.info(
-            "pipeline.completed",
-            total_latency_ms=round((time.perf_counter() - pipeline_start) * 1000, 1),
-            cache_hit=False,
-        )
-        return result_response
 
-    except TimeoutError:
-        log.error(
-            "pipeline.timeout",
-            timeout_s=settings.request_timeout_s,
-        )
-        return _reviewing_fallback(model_version)
+@router.get("/result/{attachment_id}", response_model=AnalyzeResultEnvelope)
+async def result(attachment_id: str) -> AnalyzeResultEnvelope:
+    """Poll the status/result of a queued analysis.
 
-    except Exception as exc:
-        log.exception("pipeline.unexpected_error", error=str(exc))
-        return _reviewing_fallback(model_version)
+    Returns ``processing`` while the background pipeline runs, then ``done`` with
+    the full AnalyzeResponse, or ``error`` with an explanatory detail. If no job
+    record exists, falls back to a direct cache lookup before reporting unknown.
+    """
+    job = await run_in_threadpool(jobs.get, attachment_id)
+    if job:
+        result_dict = job.get("result")
+        return AnalyzeResultEnvelope(
+            state=job.get("state", "processing"),
+            result=AnalyzeResponse(**result_dict) if result_dict else None,
+            detail=job.get("detail"),
+        )
+
+    # No job row — maybe analyzed under an older deploy whose jobs aged out.
+    settings = get_settings()
+    cached = await run_in_threadpool(
+        cache.get_by_attachment, attachment_id, settings.model_version
+    )
+    if cached:
+        return AnalyzeResultEnvelope(
+            state="done",
+            result=AnalyzeResponse(
+                status=cached["status"],
+                score=cached["score"],
+                summary=cached["summary"],
+                analyzed_at=datetime.now(UTC),
+                model_version=settings.model_version,
+                details=AnalyzeDetails(
+                    component_scores=ComponentScores(**cached.get("scoreComponents", {})),
+                    cache_hit=True,
+                ),
+            ),
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"No analysis job or cached result found for attachment {attachment_id}.",
+    )
+
+
+async def _background_analyze(payload: AnalyzeRequest, settings: Any) -> None:
+    """Run the analyze pipeline detached from the request, recording job state.
+
+    Fetch failure → job state ``error`` (mirrors the old 502). Pipeline timeout or
+    unexpected error → job ``done`` with a graceful degraded result (mirrors the old
+    200 fallback) so Next.js still gets a usable verdict. Bounded by the analyze
+    semaphore so concurrent large documents don't exhaust memory.
+    """
+    att = payload.attachment
+    tenant = payload.tenant_context.tenant_key
+    attachment_id = att.attachment_id
+    model_version = settings.model_version
+
+    async with _get_analyze_semaphore():
+        # Detached task: bind its own log context, clear it when done.
+        structlog.contextvars.bind_contextvars(tenant=tenant, attachment_id=attachment_id)
+        try:
+            # 2. Fetch bytes + sha256
+            try:
+                t0 = time.perf_counter()
+                fetch_result = await fetch_bytes(att.file_url)
+                log.info(
+                    "pipeline.fetched",
+                    bytes=fetch_result.size_bytes,
+                    content_hash=fetch_result.content_hash,
+                    mime=fetch_result.mime,
+                    latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+                )
+            except FetchError as exc:
+                log.error("integrity.fetch_failed", error=str(exc))
+                await run_in_threadpool(
+                    jobs.fail, attachment_id, f"Could not fetch attachment: {exc.reason}"
+                )
+                return
+
+            content_hash = fetch_result.content_hash
+
+            # 3. Cache check
+            cached = await run_in_threadpool(cache.get, content_hash, model_version)
+            if cached:
+                log.info(
+                    "pipeline.cache_hit",
+                    detail=(
+                        "Identical file bytes were analyzed before under this model "
+                        "version; returning the cached verdict, zero embedding/LLM tokens."
+                    ),
+                    content_hash=content_hash,
+                )
+                response = AnalyzeResponse(
+                    status=cached["status"],
+                    score=cached["score"],
+                    summary=cached["summary"],
+                    analyzed_at=datetime.now(UTC),
+                    model_version=model_version,
+                    details=AnalyzeDetails(
+                        component_scores=ComponentScores(**cached.get("scoreComponents", {})),
+                        cache_hit=True,
+                    ),
+                )
+                await run_in_threadpool(jobs.complete, attachment_id, _to_jsonable(response))
+                return
+            log.info(
+                "pipeline.cache_miss",
+                detail=(
+                    "No cached verdict for these exact file bytes + model version; running "
+                    "the full extract/embed/score/summarize pipeline."
+                ),
+                content_hash=content_hash,
+            )
+
+            # Steps 4-11: timeout + catch-all guard.
+            pipeline_start = time.perf_counter()
+            try:
+                result_response = await asyncio.wait_for(
+                    _run_pipeline(payload, fetch_result, settings),
+                    timeout=settings.analyze_timeout_s,
+                )
+                log.info(
+                    "pipeline.completed",
+                    total_latency_ms=round((time.perf_counter() - pipeline_start) * 1000, 1),
+                    cache_hit=False,
+                )
+                await run_in_threadpool(
+                    jobs.complete, attachment_id, _to_jsonable(result_response)
+                )
+            except TimeoutError:
+                log.error("pipeline.timeout", timeout_s=settings.analyze_timeout_s)
+                await run_in_threadpool(
+                    jobs.complete, attachment_id, _to_jsonable(_reviewing_fallback(model_version))
+                )
+            except Exception as exc:
+                log.exception("pipeline.unexpected_error", error=str(exc))
+                await run_in_threadpool(
+                    jobs.complete, attachment_id, _to_jsonable(_reviewing_fallback(model_version))
+                )
+        finally:
+            structlog.contextvars.clear_contextvars()
+
+
+def _to_jsonable(response: AnalyzeResponse) -> dict[str, Any]:
+    """Serialize an AnalyzeResponse to a JSON-safe dict for the job store."""
+    return response.model_dump(by_alias=True, mode="json")
 
 
 async def _run_pipeline(

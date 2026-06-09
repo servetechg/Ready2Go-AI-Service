@@ -4,6 +4,7 @@ Collections (all in the `ready2go` DB alongside app domain docs):
   ai_analysis_cache  — dedup cache; unique (contentHash, modelVersion)
   ai_audit_state     — per-tenant rolling aggregate; _id = tenantKey
   ai_call_log        — append-only AI call audit trail
+  ai_analysis_jobs   — async analyze job status; _id = attachmentId
 
 Driver: pymongo (sync).
 Used from async FastAPI routes via starlette's run_in_threadpool so we
@@ -26,10 +27,11 @@ from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Collection names — referenced by cache.py, aggregate.py, calllog.py.
+# Collection names — referenced by cache.py, aggregate.py, calllog.py, jobs.py.
 CACHE_COLLECTION = "ai_analysis_cache"
 STATE_COLLECTION = "ai_audit_state"
 LOG_COLLECTION   = "ai_call_log"
+JOBS_COLLECTION  = "ai_analysis_jobs"
 
 _client: pymongo.MongoClient | None = None  # type: ignore[type-arg]
 
@@ -58,6 +60,10 @@ def get_log_col() -> Collection:  # type: ignore[type-arg]
     return _db()[LOG_COLLECTION]
 
 
+def get_jobs_col() -> Collection:  # type: ignore[type-arg]
+    return _db()[JOBS_COLLECTION]
+
+
 def ensure_indexes() -> None:
     """Create indexes that don't exist yet (idempotent, safe to call on startup)."""
     db = _db()
@@ -79,5 +85,11 @@ def ensure_indexes() -> None:
     log = db[LOG_COLLECTION]
     log.create_index([("ts", pymongo.DESCENDING)], background=True)
     log.create_index("attachmentId", background=True)
+
+    # ai_analysis_jobs — _id IS the attachmentId. Index updatedAt for the
+    # stale-job reaper sweep on startup.
+    jobs = db[JOBS_COLLECTION]
+    jobs.create_index([("state", pymongo.ASCENDING), ("updatedAt", pymongo.ASCENDING)],
+                      name="jobs_state_updated", background=True)
 
     logger.info("store.indexes_ensured")

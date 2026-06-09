@@ -42,7 +42,7 @@ def _default_weights() -> Weights:
 
 
 def _default_bands() -> Bands:
-    return Bands(in_sync=71, reviewing=41)
+    return Bands(compliant=71, under_review=41)
 
 
 def _default_judge() -> JudgeBand:

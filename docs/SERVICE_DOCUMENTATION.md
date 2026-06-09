@@ -212,13 +212,14 @@ In short: **MongoDB is the receipt drawer; Weaviate is the brain.** The cache ma
 cheap*; the vector DB makes us *smart*. Remove the cache and the service still works but costs more;
 remove Weaviate and the service can no longer score anything meaningfully.
 
-### The three MongoDB `ai_*` collections (all inside the `ready2go` DB)
+### The four MongoDB `ai_*` collections (all inside the `ready2go` DB)
 
 | Collection | Key | Purpose |
 |------------|-----|---------|
 | `ai_analysis_cache` | unique `(contentHash, modelVersion)` | Dedup cache of final verdicts (status/score/summary/components). A hit = 0 tokens. Also stores `vectorIds` — the Weaviate chunk-object UUIDs for this document, as a direct reference to its vectors. |
 | `ai_audit_state` | `_id = tenantKey` | Per‑customer rolling counters (totals, integrity breakdown, score sum) plus two per‑doc lists — `notable` (worst‑20) and `all_analyzed` (every doc) — each entry holding `{fileName, status, score, planId, summary}` (summary excerpt ≤600 chars). Updated O(1) per analyze. Powers the audit endpoint without re‑scanning anything. |
 | `ai_call_log` | auto, sorted by `ts` | Append‑only record of every OpenAI call (kind, model, tokens, latency, success/error) for cost tracking and debugging. |
+| `ai_analysis_jobs` | `_id = attachmentId` | Async analyze job status: `state` (processing/done/error), the finished `result` payload, and `detail` on error. Backs the `/analyze` (202) → `/result` polling flow. Stale `processing` jobs are reaped to `error` on startup. |
 
 > **Ownership boundary:** MongoDB's `ready2go` database is **shared** with the Next.js app. Next.js
 > owns the business documents (`continuityplans`, `continuityauditreports`); this Python service
@@ -322,20 +323,29 @@ All weights, bands, and the judge band are **environment‑configurable** — se
 ## 8. Summarization (Per‑Doc & Audit)
 
 ### Per‑document summary — `app/summary/per_doc.py`
-After scoring, the service writes a **detailed plain‑English summary** (8–12 sentences, ≤ 2000
-chars) that captures **all the major points** of the document — its purpose, scope, key procedures
-and steps, roles/responsibilities, timelines/recovery objectives, named systems/dependencies, and
-any notable gaps. It is written this richly on purpose: the same summary is later fed into the
-organisation audit so the auditor can reason about each document's actual content. Strategy "D7": it
-uses the **complete chunk set** of the document (we own the whole document, so no retrieval/subset is
-needed).
+After scoring, the service writes a **plan‑review summary** (≤ 2000 chars) framed for the demo. It
+is **not** a neutral description and carries **no score/status language** (those are separate
+fields). Instead it reviews the document in **three labeled sections**:
+
+```
+Overview: what the document is, the scope it covers, and the concrete response actions it
+describes for the event (taken or planned) — procedures, roles, timelines, systems, coordination.
+
+What went well: the plan's genuine strengths — what it covers thoroughly or handles effectively.
+
+Areas for improvement: concrete gaps, missing elements, or weak spots worth attention.
+```
+
+It is written this way on purpose: the same summary feeds the organisation audit, so the quality of
+the audit narrative depends directly on the quality of these per‑doc reviews. Strategy "D7": it uses
+the **complete chunk set** of the document (we own the whole document, so no retrieval/subset needed).
 
 - **Short docs** (combined text ≤ 16,000 chars): a **single LLM pass** → `{"summary": "..."}`.
-- **Long docs** (> 16,000 chars): **map‑reduce** — summarise text in 12,000‑char batches (**no
-  batch cap**, so the whole document is covered, not just its opening) into short phrases, then
-  reduce those phrases into one final summary. Cost is bounded by the larger batch size.
-- **No OpenAI key / extraction failed:** a deterministic fallback like
-  `"{CATEGORY} artifact '{fileName}' … pending analysis"`. Always ≤ 2000 chars.
+- **Long docs** (> 16,000 chars): **map‑reduce** — each 12,000‑char batch is mined for *key points,
+  strengths, and gaps* (**no batch cap**, run **concurrently** so large PDFs don't stall), then
+  reduced into the three‑section summary.
+- **No OpenAI key / extraction failed:** a deterministic placeholder that keeps the same
+  Overview / What went well / Areas for improvement shape (sections marked "pending"). Always ≤ 2000 chars.
 
 ### Organisation audit narrative — `app/summary/audit.py`
 `POST /v1/audit/summary` produces a short audit paragraph for the whole customer. It does **not**
@@ -343,12 +353,14 @@ re‑scan documents — it reads the **rolling counters** already accumulated in
 
 - **Posture** is **deterministic** (`derive_posture`): `At Risk` (no plans, any deviations, avg
   score < 55, or nothing analysed), `Steady` (any reviewing or avg < 75), else `Resilient`.
-- **Narrative** (`summary` ≤ 1500 chars + up to **8** `findings`, each ≤ 350 chars) is generated by
-  `gpt-4o-mini` from the totals, category counts, integrity breakdown, and a sample of analyzed
-  documents — **each sample entry now carries that document's summary excerpt** (≤600 chars, stored
-  in `ai_audit_state`), so the auditor reasons about real content, not just scores. The sample is the
-  worst‑scoring docs (size set by `AUDIT_SAMPLE_CAP`; `0` = the whole corpus). Falls back to a
-  deterministic message if no key/plans.
+- **Narrative** (`summary` ≤ 1500 chars + **4–8** `findings`, each ≤ 350 chars) is generated by
+  `gpt-4o-mini` from the totals, category counts, and a sample of analyzed documents — **each sample
+  entry carries that document's summary excerpt** (≤600 chars, stored in `ai_audit_state`); the
+  per‑doc `status`/`score` are **stripped** before sending so the narrative is purely content‑driven.
+  The narrative describes what the plans **collectively cover** and the overall what‑went‑well /
+  areas‑for‑improvement story (no scores/verdicts). `findings` are **balanced** — both strengths and
+  gaps. The sample is the worst‑scoring docs (size set by `AUDIT_SAMPLE_CAP`; `0` = the whole corpus).
+  Falls back to a deterministic message if no key/plans.
 - **Fallback sample (`AUDIT_FALLBACK_CAP`).** When `AUDIT_SAMPLE_CAP=0` and the full-corpus call
   doesn't yield an AI narrative (typically the payload exceeds the model's context window), the
   audit automatically retries with only the worst‑`AUDIT_FALLBACK_CAP` (default 50) documents and
@@ -395,10 +407,17 @@ are sent.
 
 ---
 
-### 9.1 `POST /v1/integrity/analyze` — score one document
+### 9.1 `POST /v1/integrity/analyze` — queue a document for scoring (async)
 
-Runs the full 12‑step pipeline. Always returns **HTTP 200** (even on graceful fallback); only a
-fetch failure returns **502**, and a missing `tenantKey` returns **400**.
+**This endpoint is asynchronous.** It validates the request, queues the full pipeline to run in
+the background, and returns **HTTP 202** immediately — it does *not* block while a large PDF is
+fetched, extracted, embedded, scored, and summarised (which can take 30–90s). The caller then
+**polls** [`GET /v1/integrity/result/{attachmentId}`](#911-get-v1integrityresultattachmentid--poll-for-the-result)
+until the job finishes. A missing `tenantKey` still returns **400**.
+
+> **Why async?** Large documents took up to ~90s synchronously and risked client/proxy timeouts.
+> Running in the background removes the wait, lets the pipeline use a more generous internal timeout
+> (`ANALYZE_TIMEOUT_S`, default 300s), and bounds concurrent heavy runs (`ANALYZE_CONCURRENCY`).
 
 #### Request body: `AnalyzeRequest`
 
@@ -472,13 +491,69 @@ Top‑level `AnalyzeRequest`:
 | `extracted_text` | `extractedText` | string\|null | ❌ | Reserved; **not used in v1** (the service extracts text itself). | "Reserved for future use — the service reads the file's text itself, so this is ignored today." |
 | `vector_key` | `vectorKey` | string\|null | ❌ | Reserved hint; **not used in v1**. | "Reserved for future use. Ignored today." |
 
-#### Response body: `AnalyzeResponse`
+#### 202 response body: `AnalyzeAccepted`
+
+```json
+{
+  "state": "processing",
+  "attachmentId": "att_001",
+  "pollUrl": "/v1/integrity/result/att_001"
+}
+```
+
+| Field | Alias | Type | Meaning |
+|-------|-------|------|---------|
+| `state` | — | `"processing"` | Always `processing` on the 202 ack. |
+| `attachment_id` | `attachmentId` | string | Echoes the submitted attachment id — use it to poll. |
+| `poll_url` | `pollUrl` | string | Convenience path to poll for the result. |
+
+---
+
+### 9.1.1 `GET /v1/integrity/result/{attachmentId}` — poll for the result
+
+Returns the job's current state. Poll every ~2s until `state != "processing"`. Always **HTTP 200**
+while a job (or cached result) exists; **404** only when the attachment was never submitted and has
+no cached verdict.
+
+```json
+{
+  "state": "done",
+  "result": {
+    "status": "Under Review",
+    "score": 63,
+    "summary": "Overview: A business continuity procedure for the finance department. It defines recovery roles, escalation contacts, target recovery times for core systems, and failover steps for the primary data centre, and covers backup verification and staff call-trees.\n\nWhat went well: Clear recovery roles and escalation paths, concrete recovery-time targets, and a documented data-centre failover sequence with backup verification.\n\nAreas for improvement: No testing/exercise cadence is specified, and no owner is named for ongoing plan maintenance.",
+    "analyzedAt": "2026-06-05T14:30:00Z",
+    "modelVersion": "integrity-v1",
+    "details": {
+      "componentScores": { "content": 71, "name": 40, "quality": 95, "duplication": 100 },
+      "similarFiles": [ { "attachmentId": "att_009", "similarity": 0.81 } ],
+      "cacheHit": false,
+      "degraded": false
+    }
+  },
+  "detail": null
+}
+```
+
+| `state` | Meaning | `result` | `detail` |
+|---------|---------|----------|----------|
+| `processing` | Pipeline still running — keep polling. | `null` | `null` |
+| `done` | Finished. Write `result` to `continuityplans` as before. | `AnalyzeResponse` (below) | `null` |
+| `error` | Could not produce a verdict (e.g. file unreachable). Re‑submit to retry. | `null` | human‑readable reason |
+
+> Pipeline timeouts / transient dependency failures still resolve to **`done`** with a graceful
+> degraded `result` (`details.degraded = true`), mirroring the old behaviour — `error` is reserved
+> for hard failures like an unfetchable `fileUrl`.
+
+#### The `result` payload: `AnalyzeResponse`
+
+When `state` is `done`, `result` holds the verdict:
 
 ```json
 {
   "status": "Under Review",
   "score": 63,
-  "summary": "A 12-page business continuity procedure for the finance department. It defines recovery roles, escalation contacts, and target recovery times for core systems, and walks through failover steps for the primary data centre. It covers backup verification and staff call-trees, but does not specify a testing cadence or name an owner for plan maintenance.",
+  "summary": "…",
   "analyzedAt": "2026-06-05T14:30:00Z",
   "modelVersion": "integrity-v1",
   "details": {
@@ -494,7 +569,7 @@ Top‑level `AnalyzeRequest`:
 |-------|-------|------|---------|--------------------------|
 | `status` | — | `"Compliant"\|"Under Review"\|"Non-Compliant"` | The headline verdict. Exact strings — the UI keys off them. | "Our verdict on whether this document belongs in this plan. **Compliant** = good match (score ≥ 71); **Under Review** = borderline, worth a human look (41–70); **Non-Compliant** = likely mis‑filed or unreadable (below 41)." |
 | `score` | — | int 0–100 | Composite integrity score. | "An overall confidence score from 0–100 that this document fits the plan. It blends four checks: content match (50%), filename match (19%), text quality (19%), and uniqueness (12%)." |
-| `summary` | — | string ≤2000 | A detailed write-up covering all the document's major points. | "An AI‑generated summary of what this document actually is — its purpose, scope, key procedures, roles, timelines, and any gaps — based on its full text." |
+| `summary` | — | string ≤2000 | Plan‑review write‑up in **three labeled sections** (`Overview` / `What went well` / `Areas for improvement`), separated by blank lines. Carries no score/status language. **Render preserving line breaks** (e.g. CSS `white-space: pre-line`). | "A review of this document — what it covers and the response actions it describes, plus what it does well and where it could improve." |
 | `analyzed_at` | `analyzedAt` | datetime (ISO) | When this response was produced. | "The date and time this analysis was performed." |
 | `model_version` | `modelVersion` | string | e.g. `integrity-v1`; bump invalidates cache. | "The version of the analysis model used. Shown so results can be compared fairly over time." |
 | `details` | — | object\|null | `AnalyzeDetails` (below). | "The detailed breakdown behind the score (see below)." |
@@ -556,7 +631,7 @@ Returns **HTTP 200**.
   "totals": { "plans": 8, "attachments": 47, "analyzed": 35 },
   "averageScore": 62,
   "counts": { "coop": 12, "bcp": 20, "compliance": 10, "response": 5 },
-  "integrity": { "inSync": 18, "reviewing": 12, "deviation": 5, "unanalyzed": 12 },
+  "integrity": { "compliant": 18, "underReview": 12, "nonCompliant": 5, "unanalyzed": 12 },
   "plans": [
     {
       "planId": "plan_abc",
@@ -580,7 +655,7 @@ Top‑level fields:
 | `totals` | — | `AuditTotals` | ✅ | `{plans, attachments, analyzed}` (ints, default 0). | "Headline counts: how many plans and files exist, and how many have been analysed so far." |
 | `average_score` | `averageScore` | int | ❌ (default 0) | Org average supplied by Next.js. | "The average integrity score across all analysed files — a quick health number for the whole account." |
 | `counts` | — | `AuditCounts` | ✅ | `{coop, bcp, compliance, response}` (ints). | "How many files fall into each plan type (COOP, BCP, Compliance, Response)." |
-| `integrity` | — | `IntegrityBreakdown` | ✅ | `{inSync, reviewing, deviation, unanalyzed}` (ints; alias `inSync`). The JSON keys are internal counter names; they map to the Compliant / Under Review / Non-Compliant verdicts respectively. | "How many files landed in each verdict bucket: Compliant, Under Review, Non-Compliant, and not‑yet‑analysed." |
+| `integrity` | — | `IntegrityBreakdown` | ✅ | `{compliant, underReview, nonCompliant, unanalyzed}` (ints). Keys match the verdict vocabulary. **Legacy keys `{inSync, reviewing, deviation}` are NOT accepted** (hard cutover — send the new keys, see §9.5). | "How many files landed in each verdict bucket: Compliant, Under Review, Non-Compliant, and not‑yet‑analysed." |
 | `plans` | — | `AuditPlan[]` | ❌ (default `[]`) | Plan‑level detail (see below). | "Per‑plan breakdown used to write the audit narrative." |
 
 `AuditPlan`:
@@ -600,11 +675,13 @@ Top‑level fields:
 
 ```json
 {
-  "summary": "8 plans, 47 attachments tracked. Coverage gaps and a few mis-filed compliance docs.",
+  "summary": "Across the account's plans, response coverage spans emergency management, federal continuity, and compliance. The plans collectively define agency roles, escalation paths, recovery objectives, and coordination across emergency support functions. They handle multi-agency coordination and recovery sequencing well, while leaving room to strengthen exercise/testing cadence and private-sector integration.",
   "findings": [
-    "12 attachments still unanalyzed.",
-    "5 deviations found, mostly in compliance.",
-    "Average integrity score 62 — trending down."
+    "Strong multi-agency coordination and clear ESF structure across the response plans.",
+    "Federal continuity directive defines a clear four-phase lifecycle with accountable leadership roles.",
+    "Improvement: no testing/exercise cadence is specified in several plans.",
+    "Improvement: private-sector integration into response is largely absent.",
+    "Improvement: a few compliance documents lack named maintenance owners."
   ],
   "posture": "Steady",
   "averageScore": 62,
@@ -614,8 +691,8 @@ Top‑level fields:
 
 | Field | Alias | Type | Meaning | UI Tooltip (ℹ️ on hover) |
 |-------|-------|------|---------|--------------------------|
-| `summary` | — | string ≤1500 | Detailed audit narrative. | "A detailed AI‑written summary of the overall health of this account's continuity plans." |
-| `findings` | — | string[] (≤8) | Key bullet findings. | "Up to eight key takeaways — the most important things to act on, such as coverage gaps or mis‑filed documents." |
+| `summary` | — | string ≤1500 | Content‑driven audit narrative — what the plans collectively cover, with overall strengths and areas for improvement (no scores/verdicts in the text). | "A review of what this account's plans cover, what they handle well, and where they could improve." |
+| `findings` | — | string[] (4–8) | **Balanced** bullets — both strengths (what went well) and areas for improvement, grounded in the documents. | "Up to eight key takeaways — a balanced mix of what's working well and what to improve across the plans." |
 | `posture` | — | `"Resilient"\|"Steady"\|"At Risk"` | Deterministic overall posture. | "An overall readiness rating. **Resilient** = healthy; **Steady** = mostly fine with some items to review; **At Risk** = significant gaps or deviations that need attention." |
 | `average_score` | `averageScore` | int | Org average. | "The average integrity score (0–100) across all analysed files in the account." |
 | `degraded` | — | bool | True when a **reduced fallback sample** (worst-N) was used instead of the full set — e.g. the full-corpus audit was too big for the model, or an internal failure forced a payload-derived response. | "True means this audit was generated from a reduced set of documents (a safety fallback), so it may be less complete than usual. It will be regenerated fully on the next run." |
@@ -630,6 +707,50 @@ Top‑level fields:
 | `GET /readyz` | none | `{status, env, modelVersion, dependencies:{weaviate, mongodb, openai}}` — live connectivity probes; `degraded` if any configured dep fails. |
 | `GET /metrics` | none | In‑process counters: `requests_total`, `cache_hits/misses`, `cache_hit_ratio`, `pipeline_errors`, `pipeline_timeouts`, `tokens_total`, `avg_latency_ms`. |
 | `GET /v1/diagnostics/calls?attachmentId=&limit=` | **required** | Recent `ai_call_log` rows (`limit` default 50, max 200) for cost/error tracing. |
+
+---
+
+### 9.5 Migration notes — expected Next.js changes
+
+Two contract changes landed together. Both are **backward‑compatible for now**, so Next.js can
+migrate at its own pace, but the old shapes are deprecated.
+
+**1. `/v1/integrity/analyze` is now asynchronous (202 + polling).**
+
+- **Before:** `POST /analyze` blocked and returned the `AnalyzeResponse` (200).
+- **Now:** `POST /analyze` returns **202** `{state, attachmentId, pollUrl}` immediately. Poll
+  `GET /v1/integrity/result/{attachmentId}` (~2s interval) until `state` is `done` (use
+  `result`) or `error` (surface `detail`, allow re‑submit). Write `result` to `continuityplans`
+  exactly as before — only *when* you receive it changes.
+- **Re‑submit on timeout:** if polling exceeds your client budget (e.g. >5 min), just
+  `POST /analyze` again — it overwrites the job and is cheap on a cache hit.
+- *(No 502 from `/analyze` anymore: an unfetchable `fileUrl` now surfaces as a job `state:"error"`
+  on `/result`, not a synchronous 502.)*
+
+**2. Status‑count vocabulary renamed to match the verdicts — ⚠️ BREAKING.**
+
+- The `/v1/audit/summary` request's `integrity` object **must** now use
+  `{compliant, underReview, nonCompliant, unanalyzed}`. The legacy keys
+  `{inSync, reviewing, deviation}` are **no longer accepted** — there is **no alias / fallback**.
+  If a request still sends the old keys, those buckets are read as **0**, which skews the posture
+  and the fallback narrative.
+- **Action required:** Next.js must switch the audit payload to the new keys and **deploy in
+  lockstep** with this service (hard cutover, not a gradual migration). Old → new mapping:
+  `inSync → compliant`, `reviewing → underReview`, `deviation → nonCompliant`,
+  `unanalyzed → unanalyzed` (unchanged).
+- **Next.js‑owned data:** the `continuityauditreports` collection (and any UI reading
+  `integrity.inSync/reviewing/deviation`) is owned by the Next.js app — this service does not write
+  or migrate it. Rename those stored keys on the Next.js side to match for end‑to‑end consistency.
+
+**3. Summary content reframed (no contract change, render tweak).**
+
+- Per‑doc `summary` and the audit `summary`/`findings` are still the same types (`string` /
+  `string[]`) — **no payload change**. Only the *content* changed: per‑doc summaries are now a
+  plan review in three labeled sections (`Overview` / `What went well` / `Areas for improvement`),
+  and the audit narrative/findings are content‑driven (balanced strengths + improvements, no
+  scores narrated).
+- **UI:** the per‑doc `summary` now contains newlines. Render it preserving line breaks
+  (e.g. CSS `white-space: pre-line`) so the three sections display correctly in the demo.
 
 ---
 
@@ -789,8 +910,11 @@ All settings are environment variables, loaded once and cached by `get_settings(
 | `WEIGHT_NAME` | `0.19` | How much the **filename‑match** signal counts. Increase if filenames are reliable in your data; decrease if people name files randomly. |
 | `WEIGHT_QUALITY` | `0.19` | How much the **extraction‑quality** signal counts (did we actually get real text, or was it a blank/scanned page?). Increase to penalise unreadable uploads more. |
 | `WEIGHT_DUPLICATION` | `0.12` | How much the **uniqueness** signal counts (is this a near‑duplicate of another file in the same plan?). Increase to discourage duplicate uploads. |
-| `BAND_IN_SYNC` | `71` | The score cutoff at/above which a document is labelled **Compliant** (good). Raise it to make "Compliant" harder to earn (stricter), lower it to be more lenient. |
-| `BAND_REVIEWING` | `41` | The score cutoff at/above which a document is **Under Review**; anything below becomes **Non-Compliant**. Tune together with `BAND_IN_SYNC` to set how strict the three‑way verdict is. |
+| `BAND_COMPLIANT` | `71` | The score cutoff at/above which a document is labelled **Compliant** (good). Raise it to make "Compliant" harder to earn (stricter), lower it to be more lenient. *(Renamed from `BAND_IN_SYNC`, which is no longer accepted.)* |
+| `BAND_UNDER_REVIEW` | `41` | The score cutoff at/above which a document is **Under Review**; anything below becomes **Non-Compliant**. Tune together with `BAND_COMPLIANT` to set how strict the three‑way verdict is. *(Renamed from `BAND_REVIEWING`, which is no longer accepted.)* |
+| `ANALYZE_CONCURRENCY` | `3` | Max analyze pipelines running in the background at once. Requests beyond this queue (a memory guard so a burst of large PDFs can't OOM the box). Raise on a bigger box for more throughput. |
+| `ANALYZE_TIMEOUT_S` | `300.0` | Max seconds a single background analyze run may take before settling on a graceful degraded result. More generous than `REQUEST_TIMEOUT_S` because no client is blocked — the caller is polling. |
+| `JOB_STALE_SECONDS` | `600` | On startup, analyze jobs left in `processing` longer than this (e.g. from a crash mid‑run) are flipped to `error` so pollers aren't stuck forever. |
 | `LLM_JUDGE_BAND` | `60,72` | The borderline score range (`low,high`) where the cheap rule‑based score is uncertain, so the service spends an extra AI call to double‑check the verdict. Widen it to use the AI judge more often (more accurate, more cost); narrow/disable to save money. |
 | `PARSER_BACKEND` | `basic` | Which engine extracts text from files. `basic` = built‑in pure‑Python readers (PDF/DOCX/XLSX/CSV), no OCR. `liteparse` is reserved for a future OCR‑capable backend (reads scanned/image PDFs). Leave as `basic` unless OCR is added. |
 | Cloudinary / Seed vars | — | `CLOUDINARY_*` and `SEED_*` are used only by **offline seed/prep scripts** to create dev/staging test data — they are never read on the live request path. Ignore them for normal operation. |
@@ -841,7 +965,7 @@ Every Python module under `app/`, its role, and key functions. (Who/what/why per
 ### `app/summary/` — natural‑language output
 | File | Role |
 |------|------|
-| [app/summary/per_doc.py](../app/summary/per_doc.py) | `one_liner()` — per‑doc ≤2000‑char detailed summary covering all major points (single‑pass or map‑reduce) with deterministic fallback. |
+| [app/summary/per_doc.py](../app/summary/per_doc.py) | `one_liner()` — per‑doc ≤2000‑char plan‑review summary in three labeled sections (Overview / What went well / Areas for improvement), single‑pass or concurrent map‑reduce, with deterministic fallback. |
 | [app/summary/audit.py](../app/summary/audit.py) | `build()` + `derive_posture()` — bounded org audit narrative (≤1500 chars, ≤8 findings, posture). |
 
 ### `app/vectors/` — the Weaviate layer

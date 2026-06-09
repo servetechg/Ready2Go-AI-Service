@@ -1,17 +1,23 @@
-"""Per-document <=2000-char detailed summary (captures all major points).
+"""Per-document <=2000-char plan-review summary.
+
+The summary is a review of the document framed for the demo, with three labeled
+sections — Overview / What went well / Areas for improvement — describing what the
+plan covers and the response actions it defines for an event. It deliberately
+carries NO score/status language (those live as separate response fields).
 
 Approach (D7 — full-document, no retrieval subset):
   - Use the complete chunk set (all of this document's chunks from Weaviate).
   - If the chunks fit in the LLM context budget, send them all at once.
-  - If too many chunks, map-reduce: group into batches, summarise each batch
-    to a phrase, then reduce the phrases to one sentence.
+  - If too many chunks, map-reduce: group into batches, extract key points +
+    strengths + gaps per batch, then reduce into the three-section summary.
   - Never does a similarity search — we own the whole document.
-  - Falls back to a deterministic string if the LLM is unavailable or the
-    API key is not configured.
+  - Falls back to a deterministic placeholder (same section shape) if the LLM is
+    unavailable or the API key is not configured.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -29,6 +35,13 @@ _SINGLE_PASS_CHARS = 16_000
 # for very large documents (we no longer cap the number of batches, so this is
 # the main lever keeping cost bounded while still covering the whole document).
 _BATCH_CHARS = 12_000
+
+# Max MAP calls in flight at once. A large document (e.g. 500+ pages → ~70+
+# batches) would otherwise run sequentially and blow the request timeout. Running
+# them concurrently keeps full-document coverage but bounds wall-clock to roughly
+# ceil(batches / _MAP_CONCURRENCY) round-trips. Kept modest to stay within OpenAI
+# rate limits (tenacity still retries on 429s).
+_MAP_CONCURRENCY = 8
 
 
 async def one_liner(
@@ -84,15 +97,22 @@ async def one_liner(
 # ---------------------------------------------------------------------------
 
 _SYSTEM = (
-    "You are a continuity-of-operations document analyst for the Ready2Go platform. "
-    "Return ONLY valid JSON: "
-    "{\"summary\": \"<plain English, 8-12 sentences, max 1800 chars, no markdown>\"} "
-    "Write a thorough summary that captures ALL the major points of this specific document: "
-    "what it is and its purpose; the scope and what it covers; the key procedures and steps; "
-    "the roles and responsibilities it assigns; any timelines, recovery objectives (RTO/RPO), "
-    "or deadlines; the systems, resources, or dependencies it names; and any notable gaps or "
-    "missing elements. Be factual and grounded only in the text provided. "
-    "No marketing language. Do not mention the file name."
+    "You are a continuity-of-operations reviewer for the Ready2Go platform. You are "
+    "reviewing one plan/document and how it prepares for or responds to an event. "
+    "Return ONLY valid JSON: {\"summary\": \"<plain text, no markdown, max 1800 chars>\"}. "
+    "The summary MUST contain exactly these three labeled sections, each on its own line "
+    "and separated by a blank line, in this order:\n"
+    "Overview: 3-5 sentences on what this document is, the scope it covers, and the "
+    "concrete actions it describes for the event — whether already taken or planned "
+    "(procedures, roles/responsibilities, timelines, systems/resources, coordination).\n"
+    "What went well: 2-4 sentences (or short clauses) on the genuine strengths — what "
+    "this plan covers thoroughly or handles effectively.\n"
+    "Areas for improvement: 2-4 sentences on concrete gaps, missing elements, or weak "
+    "spots that would benefit from attention.\n"
+    "Keep every point grounded ONLY in the provided text — do not invent specifics. "
+    "Do NOT mention any score, rating, status, percentage, or words like compliant / "
+    "non-compliant / under review. Do NOT mention the file name. No marketing language. "
+    "Keep the three section labels exactly as written above."
 )
 
 
@@ -131,22 +151,32 @@ async def _map_reduce(
     # summary reflects the WHOLE document, not just its opening. Cost stays
     # bounded by using a larger batch size (fewer, bigger MAP calls).
     batches = [text[i:i + _BATCH_CHARS] for i in range(0, len(text), _BATCH_CHARS)]
-    phrases = []
-    for batch in batches:
-        r = await chat_json(
-            messages=[
-                {"role": "system", "content":
-                    "Summarise this excerpt in 1-2 sentences. "
-                    "Return JSON: {\"phrase\": \"<text>\"}"},
-                {"role": "user", "content": batch},
-            ],
-            fallback={"phrase": ""},
-            max_tokens=80,
-            log_call=log_call,
-        )
-        p = r.get("phrase", "").strip()
-        if p:
-            phrases.append(p)
+
+    # Run the MAP calls with bounded concurrency. Sequential awaits would make a
+    # large document (~70+ batches) exceed the request timeout; a semaphore keeps
+    # us within OpenAI rate limits while collapsing wall-clock time. asyncio.gather
+    # preserves order, so the reduced summary still follows the document's flow.
+    semaphore = asyncio.Semaphore(_MAP_CONCURRENCY)
+
+    async def _summarise_batch(batch: str) -> str:
+        async with semaphore:
+            r = await chat_json(
+                messages=[
+                    {"role": "system", "content":
+                        "From this excerpt of a continuity/response plan, extract the key "
+                        "points it covers, any notable strengths (things handled well), and "
+                        "any gaps or missing elements. 1-3 short sentences. "
+                        "Return JSON: {\"phrase\": \"<text>\"}"},
+                    {"role": "user", "content": batch},
+                ],
+                fallback={"phrase": ""},
+                max_tokens=200,
+                log_call=log_call,
+            )
+            return r.get("phrase", "").strip()
+
+    results = await asyncio.gather(*(_summarise_batch(b) for b in batches))
+    phrases = [p for p in results if p]
 
     if not phrases:
         return ""
@@ -170,11 +200,19 @@ async def _map_reduce(
 
 
 def _fallback(file_name: str, plan_label: str, plan_category: str) -> str:
-    """Deterministic description when the LLM is unavailable."""
+    """Deterministic placeholder when the LLM is unavailable.
+
+    Keeps the same three-section shape so the UI renders consistently; the real
+    strengths/improvements are filled in on the next successful run.
+    """
     cat_map = {"coop": "COOP", "bcp": "BCP", "compliance": "Compliance"}
     cat = cat_map.get(plan_category, "continuity")
     return (
-        f"{cat} artifact '{file_name}' filed under the {plan_label} plan. "
-        "Automated content analysis is pending — the document has been stored and "
-        "will be summarised in detail on the next successful analysis run."
+        f"Overview: A {cat} document filed under the {plan_label} plan. "
+        "The document has been stored, but a detailed content review is not yet "
+        "available.\n\n"
+        "What went well: Pending — a full review will be generated on the next "
+        "successful run.\n\n"
+        "Areas for improvement: Pending — a full review will be generated on the "
+        "next successful run."
     )[:2000]

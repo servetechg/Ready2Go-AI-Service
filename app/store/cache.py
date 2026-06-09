@@ -23,6 +23,20 @@ def get(content_hash: str, model_version: str) -> dict[str, Any] | None:
     )
 
 
+def get_by_attachment(attachment_id: str, model_version: str) -> dict[str, Any] | None:
+    """Return the most recent cached verdict for an attachmentId (by analyzedAt).
+
+    Used by the /result polling endpoint when no job record exists — e.g. the
+    attachment was analyzed by a previous deploy whose job rows have since aged
+    out. Keyed on the existing attachmentId index.
+    """
+    return get_cache_col().find_one(
+        {"attachmentId": attachment_id, "modelVersion": model_version},
+        {"_id": 0},
+        sort=[("analyzedAt", -1)],
+    )
+
+
 def put(
     *,
     attachment_id: str,

@@ -95,6 +95,7 @@ def mock_mongo():
         patch("app.store.aggregate.get_state_col", return_value=db["ai_audit_state"]),
         patch("app.store.calllog.get_log_col", return_value=db["ai_call_log"]),
         patch("app.store.models.get_cache_col", return_value=cache_col),
+        patch("app.store.jobs.get_jobs_col", return_value=db["ai_analysis_jobs"]),
     ):
         yield cache_col
 
@@ -124,7 +125,10 @@ def app_client(mock_mongo, mock_weaviate):
     ):
         from app.main import create_app
         app = create_app()
-        return TestClient(app, raise_server_exceptions=False)
+        # Context-manager form keeps the portal event loop alive across requests so
+        # background analyze tasks (asyncio.create_task) run to completion between polls.
+        with TestClient(app, raise_server_exceptions=False) as client:
+            yield client
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +137,33 @@ def app_client(mock_mongo, mock_weaviate):
 
 def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TOKEN}"}
+
+
+def _analyze_and_wait(client, payload=None, headers=None, tries=300, delay=0.02):
+    """POST /analyze (async 202), then poll /result until the job settles.
+
+    Returns the final envelope dict {state, result, detail}. The background
+    pipeline runs on the TestClient's portal event loop, so real-time polling
+    lets it progress to done/error.
+    """
+    import time as _t
+
+    payload = payload if payload is not None else ANALYZE_PAYLOAD
+    headers = headers or _auth_headers()
+
+    r = client.post("/v1/integrity/analyze", json=payload, headers=headers)
+    assert r.status_code == 202, r.text
+    attachment_id = r.json()["attachmentId"]
+
+    env = None
+    for _ in range(tries):
+        rr = client.get(f"/v1/integrity/result/{attachment_id}", headers=headers)
+        assert rr.status_code == 200, rr.text
+        env = rr.json()
+        if env["state"] != "processing":
+            return env
+        _t.sleep(delay)
+    raise AssertionError(f"analyze job did not settle in time: {env}")
 
 
 # ---------------------------------------------------------------------------
@@ -173,21 +204,17 @@ class TestAnalyzeContract:
             return_value=Response(200, json=_embedding_response(1))
         )
 
-        resp = app_client.post(
-            "/v1/integrity/analyze",
-            json=ANALYZE_PAYLOAD,
-            headers=_auth_headers(),
-        )
+        env = _analyze_and_wait(app_client)
 
-        # Pipeline may return Reviewing if extraction/summary fails — that's OK.
-        # What we assert is the shape of the response contract.
-        assert resp.status_code == 200
-        body = resp.json()
+        # Pipeline may settle on a degraded verdict if extraction/summary fails —
+        # that's OK. What we assert is the shape of the result contract.
+        assert env["state"] == "done"
+        body = env["result"]
         assert body["status"] in {"Compliant", "Under Review", "Non-Compliant"}
         assert isinstance(body["score"], int)
         assert 0 <= body["score"] <= 100
         assert isinstance(body["summary"], str)
-        assert len(body["summary"]) <= 1000
+        assert len(body["summary"]) <= 2000
         assert "analyzedAt" in body
         assert "modelVersion" in body
 
@@ -208,6 +235,7 @@ class TestAnalyzeContract:
             json=ANALYZE_PAYLOAD,
             headers=_auth_headers(),
         )
+        assert resp.status_code == 202
         assert "x-request-id" in resp.headers
 
 
@@ -239,14 +267,14 @@ class TestCacheHit:
         headers = _auth_headers()
 
         # First call — should run the full pipeline.
-        r1 = app_client.post("/v1/integrity/analyze", json=ANALYZE_PAYLOAD, headers=headers)
-        assert r1.status_code == 200
+        env1 = _analyze_and_wait(app_client, headers=headers)
+        assert env1["state"] == "done"
         first_embed_calls = embed_calls
 
         # Second call with the same URL (same bytes) — should hit cache.
-        r2 = app_client.post("/v1/integrity/analyze", json=ANALYZE_PAYLOAD, headers=headers)
-        assert r2.status_code == 200
-        b2 = r2.json()
+        env2 = _analyze_and_wait(app_client, headers=headers)
+        assert env2["state"] == "done"
+        b2 = env2["result"]
 
         assert b2.get("details", {}).get("cacheHit") is True
         # No additional OpenAI calls on second request.
@@ -270,7 +298,6 @@ class TestWeaviateDegradation:
         ):
             from app.main import create_app
             app = create_app()
-            test_client = TestClient(app, raise_server_exceptions=False)
 
             respx.get("https://example.com/bcp_document.pdf").mock(
                 return_value=Response(
@@ -283,15 +310,13 @@ class TestWeaviateDegradation:
                 return_value=Response(200, json=_embedding_response(1))
             )
 
-            resp = test_client.post(
-                "/v1/integrity/analyze",
-                json=ANALYZE_PAYLOAD,
-                headers=_auth_headers(),
-            )
+            # Poll inside the patch context so the background task sees the mocks.
+            with TestClient(app, raise_server_exceptions=False) as test_client:
+                env = _analyze_and_wait(test_client)
 
-        # Never a 500 — graceful Reviewing fallback.
-        assert resp.status_code == 200
-        body = resp.json()
+        # Never a 500 — the job settles 'done' with a graceful degraded verdict.
+        assert env["state"] == "done"
+        body = env["result"]
         assert body["status"] in {"Compliant", "Under Review", "Non-Compliant"}
         assert 0 <= body["score"] <= 100
 
@@ -302,16 +327,15 @@ class TestWeaviateDegradation:
 
 class TestFetchFailure:
     @respx.mock
-    def test_unreachable_url_returns_502(self, app_client):
+    def test_unreachable_url_settles_error(self, app_client):
+        """An unreachable fileUrl makes the background job settle 'error'."""
         respx.get("https://example.com/bcp_document.pdf").mock(
             return_value=Response(404)
         )
-        resp = app_client.post(
-            "/v1/integrity/analyze",
-            json=ANALYZE_PAYLOAD,
-            headers=_auth_headers(),
-        )
-        assert resp.status_code == 502
+        env = _analyze_and_wait(app_client)
+        assert env["state"] == "error"
+        assert env["result"] is None
+        assert "fetch" in (env["detail"] or "").lower()
 
 
 # ---------------------------------------------------------------------------
@@ -373,13 +397,11 @@ class TestNameSignal:
             patch("app.vectors.repo.sibling_similarities", return_value=[]),
         ):
             from app.main import create_app
-            client = TestClient(create_app(), raise_server_exceptions=False)
-            resp = client.post(
-                "/v1/integrity/analyze", json=ANALYZE_PAYLOAD, headers=_auth_headers()
-            )
+            with TestClient(create_app(), raise_server_exceptions=False) as client:
+                env = _analyze_and_wait(client)
 
-        assert resp.status_code == 200
-        components = resp.json()["details"]["componentScores"]
+        assert env["state"] == "done"
+        components = env["result"]["details"]["componentScores"]
         assert components.get("name") == 100
 
     @respx.mock
@@ -404,13 +426,11 @@ class TestNameSignal:
             patch("app.vectors.repo.sibling_similarities", return_value=[]),
         ):
             from app.main import create_app
-            client = TestClient(create_app(), raise_server_exceptions=False)
-            resp = client.post(
-                "/v1/integrity/analyze", json=ANALYZE_PAYLOAD, headers=_auth_headers()
-            )
+            with TestClient(create_app(), raise_server_exceptions=False) as client:
+                env = _analyze_and_wait(client)
 
-        assert resp.status_code == 200
-        components = resp.json()["details"]["componentScores"]
+        assert env["state"] == "done"
+        components = env["result"]["details"]["componentScores"]
         assert components.get("name") in (0, None)
 
 
@@ -423,7 +443,7 @@ AUDIT_PAYLOAD = {
     "totals": {"plans": 2, "attachments": 5, "analyzed": 4},
     "averageScore": 70,
     "counts": {"coop": 1, "bcp": 1, "compliance": 0, "response": 0},
-    "integrity": {"inSync": 3, "reviewing": 1, "deviation": 0, "unanalyzed": 1},
+    "integrity": {"compliant": 3, "underReview": 1, "nonCompliant": 0, "unanalyzed": 1},
     "plans": [],
 }
 

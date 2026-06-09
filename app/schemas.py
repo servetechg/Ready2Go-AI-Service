@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 IntegrityStatus = Literal["Compliant", "Under Review", "Non-Compliant"]
 Posture = Literal["Resilient", "Steady", "At Risk"]
@@ -99,6 +99,25 @@ class AnalyzeResponse(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+# --- Async analyze: 202 ack + polling envelope ------------------------------
+class AnalyzeAccepted(BaseModel):
+    """202 body for POST /v1/integrity/analyze — the job was queued."""
+    state: Literal["processing"] = "processing"
+    attachment_id: str = Field(..., alias="attachmentId")
+    poll_url: str = Field(..., alias="pollUrl")
+
+    model_config = {"populate_by_name": True}
+
+
+class AnalyzeResultEnvelope(BaseModel):
+    """GET /v1/integrity/result/{attachmentId} — poll until state != processing."""
+    state: Literal["processing", "done", "error"]
+    result: AnalyzeResponse | None = None
+    detail: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
 # ---------------------------------------------------------------------------
 # Rescan / backfill: POST /v1/integrity/rescan
 # ---------------------------------------------------------------------------
@@ -127,9 +146,25 @@ class AuditCounts(BaseModel):
 
 
 class IntegrityBreakdown(BaseModel):
-    in_sync: int = Field(default=0, alias="inSync")
-    reviewing: int = 0
-    deviation: int = 0
+    """Per-status document counts in the audit payload (new verdict vocabulary).
+
+    Accepts ONLY the new keys: `compliant`, `underReview`, `nonCompliant`,
+    `unanalyzed` (camelCase; snake_case also accepted via populate_by_name). The
+    legacy keys `inSync` / `reviewing` / `deviation` are **no longer accepted** —
+    a sender still using them will have those counts read as 0. Next.js must send
+    the new keys (see §9.5 migration notes).
+    """
+    compliant: int = 0
+    under_review: int = Field(
+        default=0,
+        validation_alias=AliasChoices("underReview", "under_review"),
+        serialization_alias="underReview",
+    )
+    non_compliant: int = Field(
+        default=0,
+        validation_alias=AliasChoices("nonCompliant", "non_compliant"),
+        serialization_alias="nonCompliant",
+    )
     unanalyzed: int = 0
 
     model_config = {"populate_by_name": True}

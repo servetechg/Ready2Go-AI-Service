@@ -137,9 +137,9 @@ def _fallback_from_payload(payload: AuditSummaryRequest) -> AuditSummaryResponse
     """
     pseudo_state = {
         "integrity": {
-            "inSync": payload.integrity.in_sync,
-            "reviewing": payload.integrity.reviewing,
-            "deviation": payload.integrity.deviation,
+            "compliant": payload.integrity.compliant,
+            "underReview": payload.integrity.under_review,
+            "nonCompliant": payload.integrity.non_compliant,
         },
         "scoreSum": payload.average_score,
         "scoreCount": 1 if payload.average_score else 0,

@@ -82,7 +82,7 @@ def compute(
     # 2. Hard override — scan-only or empty: cap at Under Review + score <= 45.
     if quality.is_empty or quality.is_scan_only:
         score = min(score, 45)
-        status = "Under Review" if score >= b.reviewing else "Non-Compliant"
+        status = "Under Review" if score >= b.under_review else "Non-Compliant"
         return IntegrityResult(status=status, score=score, components=components)
 
     # 3. Normal banding.

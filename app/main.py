@@ -80,6 +80,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             # Non-fatal: service degrades gracefully without Mongo.
 
+        # Reap analyze jobs left "processing" by a previous crash/restart — their
+        # in-process background tasks are gone, so flip stale ones to "error" so a
+        # poller isn't stuck forever (Next.js re-submits on a polling timeout).
+        try:
+            from app.store.jobs import reap_stale
+            reaped = await run_in_threadpool(reap_stale, settings.job_stale_seconds)
+            if reaped:
+                log.info(
+                    "startup.jobs_reaped",
+                    detail="Flipped stale 'processing' analyze jobs to 'error' after restart.",
+                    count=reaped,
+                )
+        except Exception as exc:
+            log.warning(
+                "startup.jobs_reap_failed",
+                detail="Could not sweep stale analyze jobs; non-fatal.",
+                error=str(exc),
+            )
+
     yield
 
     # ---------------------------------------------------------------------------

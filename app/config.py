@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     reload: bool = False
     request_timeout_s: float = 25.0
 
+    # ---- Async analyze (background pipeline + polling) ------------------
+    # /v1/integrity/analyze returns 202 immediately and runs the pipeline in the
+    # background; Next.js polls /v1/integrity/result/{attachmentId}.
+    # analyze_concurrency caps how many heavy pipelines run at once (memory guard);
+    # extra requests queue. analyze_timeout_s bounds a single background run (more
+    # generous than request_timeout_s since no client is blocked). job_stale_seconds
+    # is the age past which a still-"processing" job is reaped to "error" on startup.
+    analyze_concurrency: int = 3
+    analyze_timeout_s: float = 300.0
+    job_stale_seconds: int = 600
+
     # ---- Storage paths & persistence -----------------------------------
     # DATA_DIR is the base directory for everything this service persists. Each
     # artifact below defaults to a sub-folder of DATA_DIR but can be overridden
@@ -123,9 +134,11 @@ class Settings(BaseSettings):
     weight_name: float = 0.19
     weight_quality: float = 0.19
     weight_duplication: float = 0.12
-    # Status banding thresholds (0..100).
-    band_in_sync: int = 71
-    band_reviewing: int = 41
+    # Status banding thresholds (0..100), named after the new status vocabulary
+    # (Compliant / Under Review). Only BAND_COMPLIANT / BAND_UNDER_REVIEW are
+    # accepted — the old names (BAND_IN_SYNC / BAND_REVIEWING) are no longer read.
+    band_compliant: int = 71
+    band_under_review: int = 41
     # Borderline band that triggers the optional LLM judge, e.g. "60,72".
     llm_judge_band: str = "60,72"
 

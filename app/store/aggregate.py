@@ -4,7 +4,7 @@ ai_audit_state document shape (one per tenantKey, _id = tenantKey):
   {
     _id:           tenantKey,
     counts:        {coop: N, bcp: N, compliance: N, response: N},
-    integrity:     {inSync: N, reviewing: N, deviation: N, unanalyzed: N},
+    integrity:     {compliant: N, underReview: N, nonCompliant: N, unanalyzed: N},
     scoreSum:      N,
     scoreCount:    N,
     notable:       [{fileName, status, score, planId, summary}],  # worst-N (score<60), bounded
@@ -60,11 +60,11 @@ def update(
     summary_excerpt = (summary or "").strip()[:_AUDIT_SUMMARY_CHARS]
     col = get_state_col()
 
-    # Map status string -> integrity sub-field name.
+    # Map status string -> integrity sub-field name (new status vocabulary).
     integrity_field = {
-        "Compliant":     "integrity.inSync",
-        "Under Review":  "integrity.reviewing",
-        "Non-Compliant": "integrity.deviation",
+        "Compliant":     "integrity.compliant",
+        "Under Review":  "integrity.underReview",
+        "Non-Compliant": "integrity.nonCompliant",
     }.get(status, "integrity.unanalyzed")
 
     # Map category -> counts sub-field.
@@ -122,8 +122,30 @@ def read(tenant_key: str) -> dict[str, Any]:
     """Return the current rolling state for *tenant_key* (or a zero-state dict)."""
     doc = get_state_col().find_one({"_id": tenant_key}, {"_id": 0})
     if doc:
-        return doc
+        return _normalize_integrity(doc)
     return _zero_state()
+
+
+def _normalize_integrity(doc: dict[str, Any]) -> dict[str, Any]:
+    """Fold any legacy integrity bucket keys into the new status vocabulary.
+
+    Older ai_audit_state docs were written with inSync/reviewing/deviation. We
+    rename those to compliant/underReview/nonCompliant on read so existing tenants
+    keep correct counts without a migration script — counts fully converge to the
+    new keys as new analyses arrive.
+    """
+    integrity = doc.get("integrity")
+    if not isinstance(integrity, dict):
+        return doc
+    legacy_map = {"inSync": "compliant", "reviewing": "underReview", "deviation": "nonCompliant"}
+    if not any(old in integrity for old in legacy_map):
+        return doc
+    merged = {"compliant": 0, "underReview": 0, "nonCompliant": 0, "unanalyzed": 0}
+    for key, value in integrity.items():
+        target = legacy_map.get(key, key)
+        merged[target] = merged.get(target, 0) + (value or 0)
+    doc["integrity"] = merged
+    return doc
 
 
 def mark_clean(tenant_key: str) -> None:
@@ -137,7 +159,7 @@ def mark_clean(tenant_key: str) -> None:
 def _zero_state() -> dict[str, Any]:
     return {
         "counts":       {"coop": 0, "bcp": 0, "compliance": 0, "response": 0},
-        "integrity":    {"inSync": 0, "reviewing": 0, "deviation": 0, "unanalyzed": 0},
+        "integrity":    {"compliant": 0, "underReview": 0, "nonCompliant": 0, "unanalyzed": 0},
         "scoreSum":     0,
         "scoreCount":   0,
         "notable":      [],

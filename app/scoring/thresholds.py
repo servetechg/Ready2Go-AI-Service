@@ -30,12 +30,12 @@ class Weights:
 class Bands:
     """Status banding thresholds (0-100 integer scale).
 
-    score >= in_sync   -> "Compliant"
-    score >= reviewing -> "Under Review"
-    else               -> "Non-Compliant"
+    score >= compliant     -> "Compliant"
+    score >= under_review  -> "Under Review"
+    else                   -> "Non-Compliant"
     """
-    in_sync: int
-    reviewing: int
+    compliant: int
+    under_review: int
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,7 @@ def get_weights() -> Weights:
 
 def get_bands() -> Bands:
     s = get_settings()
-    return Bands(in_sync=s.band_in_sync, reviewing=s.band_reviewing)
+    return Bands(compliant=s.band_compliant, under_review=s.band_under_review)
 
 
 def get_judge_band() -> JudgeBand:
@@ -80,8 +80,8 @@ def score_to_status(score: int, bands: Bands | None = None) -> str:
     These exact strings are the contract with the Next.js UI.
     """
     b = bands or get_bands()
-    if score >= b.in_sync:
+    if score >= b.compliant:
         return "Compliant"
-    if score >= b.reviewing:
+    if score >= b.under_review:
         return "Under Review"
     return "Non-Compliant"

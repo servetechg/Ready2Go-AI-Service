@@ -54,9 +54,9 @@ async def build(
     average_score = round(score_sum / score_count) if score_count else 0
 
     analyzed = (
-        integrity.get("inSync", 0)
-        + integrity.get("reviewing", 0)
-        + integrity.get("deviation", 0)
+        integrity.get("compliant", 0)
+        + integrity.get("underReview", 0)
+        + integrity.get("nonCompliant", 0)
     )
     totals = {
         "plans": (
@@ -82,9 +82,7 @@ async def build(
 
     summary, findings, llm_ok = await _llm_summary(
         totals=totals,
-        integrity=integrity,
         counts=counts,
-        average_score=average_score,
         sample=sample,
         log_call=log_call,
     )
@@ -119,12 +117,12 @@ def derive_posture(state: dict) -> str:
     if total_plans == 0:
         return "At Risk"
 
-    deviations = integrity.get("deviation", 0)
-    reviewing  = integrity.get("reviewing", 0)
+    deviations = integrity.get("nonCompliant", 0)
+    reviewing  = integrity.get("underReview", 0)
     analyzed = (
-        integrity.get("inSync", 0)
-        + integrity.get("reviewing", 0)
-        + integrity.get("deviation", 0)
+        integrity.get("compliant", 0)
+        + integrity.get("underReview", 0)
+        + integrity.get("nonCompliant", 0)
     )
 
     if deviations > 0 or avg < 55 or analyzed == 0:
@@ -139,23 +137,25 @@ def derive_posture(state: dict) -> str:
 # ---------------------------------------------------------------------------
 
 _SYSTEM = (
-    "You are a Continuity-of-Operations auditor for the Ready2Go platform. "
-    "You are given aggregate statistics and a list of analyzed documents in "
-    "`sampleDocs`; each entry has a `fileName`, `status`, `score`, `planId`, and a "
-    "`summary` describing what that document actually is. USE these per-document "
-    "summaries to ground your narrative and findings in the real content — name and "
-    "explain specific documents where relevant, not just the numbers. "
+    "You are a Continuity-of-Operations reviewer for the Ready2Go platform preparing "
+    "a demo-ready review of an organisation's plans. You are given category coverage "
+    "counts and a list of analyzed documents in `sampleDocs`; each entry has a "
+    "`fileName`, `planId`, and a `summary` describing the document's content and how it "
+    "prepares for or responds to an event. USE these per-document summaries to ground "
+    "your narrative and findings in the real content — name and explain specific "
+    "documents/plans where relevant. "
     "Produce ONLY valid JSON: "
-    "{\"summary\": \"<detailed narrative, 4-6 sentences, max 1400 chars, no markdown>\", "
-    "\"findings\": [\"<actionable bullet that explains the issue and its impact, "
-    "max 350 chars>\", ...]} "
-    "Rules: 4 to 8 findings, ordered by urgency; each finding must explain what the "
-    "issue is, which plans/documents/categories it affects, and why it matters. "
-    "The summary should describe overall posture, coverage across categories, the "
-    "balance of Compliant vs Under Review vs Non-Compliant files, what the documents "
-    "collectively cover, and the most important risks or gaps. "
-    "Highlight: coverage gaps, low scores, Non-Compliant files, plans without "
-    "steps or attachments, missing analysis. "
+    "{\"summary\": \"<narrative, 4-6 sentences, max 1400 chars, no markdown>\", "
+    "\"findings\": [\"<bullet, max 350 chars>\", ...]} "
+    "The summary should describe what the plans COLLECTIVELY cover across the "
+    "organisation, the response actions they define, what is handled well overall, and "
+    "where the biggest areas for improvement are. "
+    "`findings` must be 4 to 8 BALANCED bullets — include both strengths (what went "
+    "well across the plans) AND areas for improvement (gaps, missing elements, coverage "
+    "holes). Each bullet explains the point and which plans/documents/categories it "
+    "relates to. "
+    "Do NOT mention any score, rating, status, percentage, or words like compliant / "
+    "non-compliant / under review — describe content and readiness, not grades. "
     "Do NOT give legal advice or recommend actions outside continuity management."
 )
 
@@ -163,9 +163,7 @@ _SYSTEM = (
 async def _llm_summary(
     *,
     totals: dict[str, Any],
-    integrity: dict[str, Any],
     counts: dict[str, Any],
-    average_score: int,
     sample: list[dict[str, Any]],
     log_call: _LogCall = None,
 ) -> tuple[str, list[str], bool]:
@@ -175,12 +173,17 @@ async def _llm_summary(
     or returned an empty summary (so the deterministic fallback text was used) —
     the caller treats that as a signal to retry with a smaller fallback sample.
     """
+    # Deliberately omit averageScore / integrityBreakdown so the narrative is driven
+    # by document CONTENT and coverage — not scores/verdicts. Also strip per-doc
+    # status/score so the model only sees what each document is about.
+    content_docs = [
+        {"fileName": d.get("fileName"), "planId": d.get("planId"), "summary": d.get("summary", "")}
+        for d in sample
+    ]
     payload = {
-        "totals":             totals,
-        "averageScore":       average_score,
-        "categoryCounts":     counts,
-        "integrityBreakdown": integrity,
-        "sampleDocs":         sample,   # full list from caller; capped or unlimited
+        "totals":         totals,
+        "categoryCounts": counts,
+        "sampleDocs":     content_docs,   # content only; status/score removed
     }
 
     import json
