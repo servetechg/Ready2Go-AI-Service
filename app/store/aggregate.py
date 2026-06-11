@@ -1,24 +1,27 @@
-"""Per-tenant rolling audit state — O(1) update per analyze.
+"""Per-tenant rolling audit state — keyed by attachment for correct dedup/removal.
 
 ai_audit_state document shape (one per tenantKey, _id = tenantKey):
   {
-    _id:           tenantKey,
-    counts:        {coop: N, bcp: N, compliance: N, response: N},
-    integrity:     {compliant: N, underReview: N, nonCompliant: N, unanalyzed: N},
-    scoreSum:      N,
-    scoreCount:    N,
-    notable:       [{fileName, status, score, planId, summary}],  # worst-N (score<60), bounded
-    all_analyzed:  [{fileName, status, score, planId, summary}],  # every doc, no cap/threshold
-    dirty:         bool,  # True when a new analyze happened since last audit
-    updatedAt:     datetime,
+    _id:        tenantKey,
+    documents:  {                          # one entry per attachment (the source of truth)
+      <attachmentId>: {
+        category, status, score, fileName, planId, summary, updatedAt
+      },
+      ...
+    },
+    updatedAt:  datetime,
   }
 
-update() increments counters in a single MongoDB $inc/$set/$push — never reads or
-rewrites the whole doc.  This is what makes the audit O(1) per upload.
+Why a per-attachment map (not rolling $inc counters):
+  - **Idempotent.** Re-analysing the same attachment REPLACES its entry — it is never
+    double-counted, so the derived average can never drift above 100.
+  - **Removable.** Deleting a document `$unset`s its entry, so it actually disappears
+    from the subadmin's audit (the old append-only lists keyed by fileName couldn't).
+  - **Bounded.** Exactly one entry per attachment — no unbounded duplicate growth.
 
-all_analyzed holds every analyzed doc regardless of score so the audit endpoint
-can pass ALL docs to the LLM when AUDIT_SAMPLE_CAP=0.  notable keeps the
-worst-20 (score<60) for cheap fast access when a bounded sample is sufficient.
+The audit endpoint's `counts` / `integrity` / `scoreSum` / `scoreCount` / `all_analyzed`
+/ `notable` are all DERIVED on read from `documents`, so they are always consistent with
+the current set of analysed documents (no stale counters to maintain).
 """
 
 from __future__ import annotations
@@ -26,24 +29,30 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-import pymongo
-
 from app.store.models import get_state_col
 
-# Maximum number of "notable" items kept (worst scores, gaps).
-_NOTABLE_CAP = 20
-# Score threshold below which an item is "notable" (worth flagging in audit).
-_NOTABLE_THRESHOLD = 60
-# Per-item summary excerpt length stored in the rolling state. The FULL summary
-# lives in ai_analysis_cache; here we keep a bounded excerpt so the audit LLM can
-# read what each document is about without risking MongoDB's 16 MB doc-size limit
-# (all_analyzed is uncapped — one entry per analyzed document).
+# Per-item summary excerpt length stored in the rolling state. The FULL summary lives in
+# ai_analysis_cache; here we keep a bounded excerpt so the audit LLM can read what each
+# document is about while keeping the per-tenant doc well under MongoDB's 16 MB limit.
 _AUDIT_SUMMARY_CHARS = 600
+# Score threshold below which a derived `notable` entry is flagged (worst scorers).
+_NOTABLE_THRESHOLD = 60
+# Max items in the derived `notable` list.
+_NOTABLE_CAP = 20
+
+# Maps the per-document status string -> the integrity bucket key (new vocabulary).
+# Legacy all_analyzed entries also stored the verdict string here, so the same map covers them.
+_STATUS_BUCKET = {
+    "Compliant":     "compliant",
+    "Under Review":  "underReview",
+    "Non-Compliant": "nonCompliant",
+}
 
 
 def update(
     tenant_key: str,
     *,
+    attachment_id: str,
     category: str,
     status: str,
     score: int,
@@ -51,119 +60,111 @@ def update(
     plan_id: str,
     summary: str = "",
 ) -> None:
-    """O(1) increment of rolling audit state for *tenant_key*.
+    """Idempotently record one attachment's latest verdict for *tenant_key*.
 
-    Increments the appropriate integrity counter, accumulates score sum,
-    and records the doc (with a bounded summary excerpt) in all_analyzed — and
-    in the notable list too if the score is low.  Marks dirty=True.
+    `$set documents.<attachmentId>` REPLACES any prior entry for the same attachment,
+    so re-analysing never double-counts. No `$inc`/`$push` — aggregates are derived on read.
     """
     summary_excerpt = (summary or "").strip()[:_AUDIT_SUMMARY_CHARS]
-    col = get_state_col()
-
-    # Map status string -> integrity sub-field name (new status vocabulary).
-    integrity_field = {
-        "Compliant":     "integrity.compliant",
-        "Under Review":  "integrity.underReview",
-        "Non-Compliant": "integrity.nonCompliant",
-    }.get(status, "integrity.unanalyzed")
-
-    # Map category -> counts sub-field.
-    valid_cats = {"coop", "bcp", "compliance", "response"}
-    cat_field = f"counts.{category}" if category in valid_cats else "counts.coop"
-
-    update_doc: dict[str, Any] = {
-        "$inc": {
-            cat_field:       1,
-            integrity_field: 1,
-            "scoreSum":      score,
-            "scoreCount":    1,
-        },
-        "$set": {
-            "dirty":     True,
-            "updatedAt": datetime.now(UTC),
-        },
-        "$setOnInsert": {
-            "_id": tenant_key,
-        },
-        # Always record every analyzed doc — no score threshold, no cap.
-        # AUDIT_SAMPLE_CAP=0 uses this list to give the LLM the full corpus.
-        "$push": {
-            "all_analyzed": {
-                "fileName": file_name,
-                "status":   status,
-                "score":    score,
-                "planId":   plan_id,
-                "summary":  summary_excerpt,
-            }
-        },
-    }
-
-    col.update_one({"_id": tenant_key}, update_doc, upsert=True)
-
-    # Also keep a bounded notable list (worst-N, score < threshold) for fast access.
-    if score < _NOTABLE_THRESHOLD:
-        col.update_one(
-            {"_id": tenant_key},
-            {
-                "$push": {
-                    "notable": {
-                        "$each": [{"fileName": file_name, "status": status,
-                                   "score": score, "planId": plan_id,
-                                   "summary": summary_excerpt}],
-                        "$sort": {"score": pymongo.ASCENDING},
-                        "$slice": _NOTABLE_CAP,
-                    }
-                }
-            },
-        )
-
-
-def read(tenant_key: str) -> dict[str, Any]:
-    """Return the current rolling state for *tenant_key* (or a zero-state dict)."""
-    doc = get_state_col().find_one({"_id": tenant_key}, {"_id": 0})
-    if doc:
-        return _normalize_integrity(doc)
-    return _zero_state()
-
-
-def _normalize_integrity(doc: dict[str, Any]) -> dict[str, Any]:
-    """Fold any legacy integrity bucket keys into the new status vocabulary.
-
-    Older ai_audit_state docs were written with inSync/reviewing/deviation. We
-    rename those to compliant/underReview/nonCompliant on read so existing tenants
-    keep correct counts without a migration script — counts fully converge to the
-    new keys as new analyses arrive.
-    """
-    integrity = doc.get("integrity")
-    if not isinstance(integrity, dict):
-        return doc
-    legacy_map = {"inSync": "compliant", "reviewing": "underReview", "deviation": "nonCompliant"}
-    if not any(old in integrity for old in legacy_map):
-        return doc
-    merged = {"compliant": 0, "underReview": 0, "nonCompliant": 0, "unanalyzed": 0}
-    for key, value in integrity.items():
-        target = legacy_map.get(key, key)
-        merged[target] = merged.get(target, 0) + (value or 0)
-    doc["integrity"] = merged
-    return doc
-
-
-def mark_clean(tenant_key: str) -> None:
-    """Mark the audit as clean (called after a summary is generated)."""
+    now = datetime.now(UTC)
     get_state_col().update_one(
         {"_id": tenant_key},
-        {"$set": {"dirty": False, "updatedAt": datetime.now(UTC)}},
+        {
+            "$set": {
+                f"documents.{attachment_id}": {
+                    "category":   category,
+                    "status":     status,
+                    "score":      score,
+                    "fileName":   file_name,
+                    "planId":     plan_id,
+                    "summary":    summary_excerpt,
+                    "updatedAt":  now,
+                },
+                "updatedAt": now,
+            },
+            "$setOnInsert": {"_id": tenant_key},
+        },
+        upsert=True,
     )
 
 
-def _zero_state() -> dict[str, Any]:
+def remove(tenant_key: str, attachment_id: str) -> None:
+    """Drop one attachment's entry so it disappears from the tenant's audit."""
+    get_state_col().update_one(
+        {"_id": tenant_key},
+        {"$unset": {f"documents.{attachment_id}": ""},
+         "$set": {"updatedAt": datetime.now(UTC)}},
+    )
+
+
+def read(tenant_key: str) -> dict[str, Any]:
+    """Return the derived audit state for *tenant_key* (or a zero-state dict).
+
+    Aggregates `counts` / `integrity` / `scoreSum` / `scoreCount` / `all_analyzed` /
+    `notable` from the per-attachment `documents` map. Falls back to deriving from a
+    legacy doc (old `all_analyzed` list, deduped by fileName) so tenants written before
+    this change still produce a correct audit until their docs are re-analysed.
+    """
+    doc = get_state_col().find_one({"_id": tenant_key})
+    if not doc:
+        return _zero_state()
+
+    documents = doc.get("documents")
+    if isinstance(documents, dict) and documents:
+        return _derive(list(documents.values()))
+
+    # Legacy compat: derive from the old append-only list, deduped by fileName so a
+    # previously double-counted doc collapses to one entry.
+    legacy = doc.get("all_analyzed") or doc.get("notable") or []
+    if legacy:
+        by_name: dict[str, dict] = {}
+        for item in legacy:
+            by_name[item.get("fileName", id(item))] = item
+        return _derive(list(by_name.values()))
+
+    return _zero_state()
+
+
+def _derive(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute the audit-state shape `summary/audit.py` expects from per-doc entries."""
+    counts = {"coop": 0, "bcp": 0, "compliance": 0, "response": 0}
+    integrity = {"compliant": 0, "underReview": 0, "nonCompliant": 0, "unanalyzed": 0}
+    score_sum = 0
+    score_count = 0
+    all_analyzed: list[dict[str, Any]] = []
+
+    for it in items:
+        category = it.get("category", "coop")
+        if category in counts:
+            counts[category] += 1
+        bucket = _STATUS_BUCKET.get(it.get("status", ""), "unanalyzed")
+        integrity[bucket] += 1
+        score = it.get("score", 0) or 0
+        score_sum += score
+        score_count += 1
+        all_analyzed.append({
+            "fileName": it.get("fileName"),
+            "status":   it.get("status"),
+            "score":    score,
+            "planId":   it.get("planId"),
+            "summary":  it.get("summary", ""),
+        })
+
+    notable = sorted(
+        (d for d in all_analyzed if (d.get("score") or 0) < _NOTABLE_THRESHOLD),
+        key=lambda d: d.get("score") or 0,
+    )[:_NOTABLE_CAP]
+
     return {
-        "counts":       {"coop": 0, "bcp": 0, "compliance": 0, "response": 0},
-        "integrity":    {"compliant": 0, "underReview": 0, "nonCompliant": 0, "unanalyzed": 0},
-        "scoreSum":     0,
-        "scoreCount":   0,
-        "notable":      [],
-        "all_analyzed": [],
-        "dirty":        False,
+        "counts":       counts,
+        "integrity":    integrity,
+        "scoreSum":     score_sum,
+        "scoreCount":   score_count,
+        "all_analyzed": all_analyzed,
+        "notable":      notable,
         "updatedAt":    None,
     }
+
+
+def _zero_state() -> dict[str, Any]:
+    return _derive([])

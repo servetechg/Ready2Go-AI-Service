@@ -6,7 +6,7 @@ A missing tenant is always a hard error — never a silent global query.
 Operations:
   upsert_chunks        — store one document's chunks + vectors (delete-first).
   delete_by_attachment — remove all chunks for one attachment (used by upsert
-                         and by the rescan/delete-attachment routes).
+                         and by the DELETE /v1/integrity/attachments route).
   get_all_chunks       — fetch the COMPLETE chunk set for one attachment (for
                          per-doc summarization — this is a fetch-by-id, not
                          a similarity search).
@@ -50,6 +50,8 @@ class SimilarityResult:
     """Distance + metadata for a nearest-neighbour result."""
     attachment_id: str
     distance: float    # 0 = identical, 2 = opposite (Weaviate cosine distance)
+    file_name: str = ""
+    plan_id: str = ""
 
     @property
     def similarity(self) -> float:
@@ -214,14 +216,18 @@ def content_centroid(chunks: list[StoredChunk]) -> list[float] | None:
 
 def sibling_similarities(
     tenant: str,
-    plan_id: str,
     centroid: list[float],
     *,
     exclude_attachment_id: str,
+    plan_id: str | None = None,
+    model_version: str | None = None,
     limit: int = 10,
 ) -> list[SimilarityResult]:
-    """Find nearest siblings (same plan, different attachment) — duplication signal.
+    """Find nearest siblings (different attachment) — duplication signal or vault-wide search.
 
+    When plan_id is given, only siblings in that plan are searched (duplication signal).
+    When plan_id is None, the entire tenant vault is searched (similar-files endpoint).
+    When model_version is given, only chunks from that model version are included.
     Returns similarity results (most similar first).
     """
     _require_tenant(tenant)
@@ -231,13 +237,18 @@ def sibling_similarities(
         return []  # no siblings for a tenant with no data.
     tenant_col = collection.with_tenant(tenant)
 
+    base_filter = wvq.Filter.by_property("attachmentId").not_equal(exclude_attachment_id)
+    if plan_id is not None:
+        base_filter = base_filter & wvq.Filter.by_property("planId").equal(plan_id)
+    if model_version is not None:
+        base_filter = base_filter & wvq.Filter.by_property("modelVersion").equal(model_version)
+
     result = tenant_col.query.near_vector(
         near_vector=centroid,
-        filters=wvq.Filter.by_property("planId").equal(plan_id)
-                & wvq.Filter.by_property("attachmentId").not_equal(exclude_attachment_id),
+        filters=base_filter,
         limit=limit,
         return_metadata=wvq.MetadataQuery(distance=True),
-        return_properties=["attachmentId"],
+        return_properties=["attachmentId", "fileName", "planId"],
     )
 
     seen: set[str] = set()
@@ -248,8 +259,76 @@ def sibling_similarities(
             continue
         seen.add(aid)
         dist = obj.metadata.distance if obj.metadata else 1.0
-        sims.append(SimilarityResult(attachment_id=aid, distance=dist or 1.0))
+        sims.append(SimilarityResult(
+            attachment_id=aid,
+            distance=dist or 1.0,
+            file_name=str(obj.properties.get("fileName", "")),
+            plan_id=str(obj.properties.get("planId", "")),
+        ))
     return sims
+
+
+def find_exact_duplicates(
+    tenant: str,
+    content_hash: str,
+    *,
+    exclude_attachment_id: str,
+    limit: int = 50,
+) -> list[SimilarityResult]:
+    """Other attachments (same tenant) whose chunks share this contentHash → exact dupes."""
+    _require_tenant(tenant)
+    if not content_hash:
+        return []
+    client = get_client()
+    collection = client.collections.get(DOC_CHUNK_COLLECTION)
+    if not collection.tenants.exists(tenant):
+        return []
+    tenant_col = collection.with_tenant(tenant)
+
+    result = tenant_col.query.fetch_objects(
+        filters=(
+            wvq.Filter.by_property("contentHash").equal(content_hash)
+            & wvq.Filter.by_property("attachmentId").not_equal(exclude_attachment_id)
+        ),
+        limit=1000,
+        return_properties=["attachmentId", "fileName", "planId"],
+    )
+
+    seen: set[str] = set()
+    dupes = []
+    for obj in result.objects:
+        aid = str(obj.properties.get("attachmentId", ""))
+        if not aid or aid in seen:
+            continue
+        seen.add(aid)
+        dupes.append(SimilarityResult(
+            attachment_id=aid,
+            distance=0.0,
+            file_name=str(obj.properties.get("fileName", "")),
+            plan_id=str(obj.properties.get("planId", "")),
+        ))
+        if len(dupes) >= limit:
+            break
+    return dupes
+
+
+def get_attachment_content_hash(tenant: str, attachment_id: str) -> str | None:
+    """Read this attachment's contentHash from any one of its stored chunks (or None)."""
+    _require_tenant(tenant)
+    client = get_client()
+    collection = client.collections.get(DOC_CHUNK_COLLECTION)
+    if not collection.tenants.exists(tenant):
+        return None
+    tenant_col = collection.with_tenant(tenant)
+
+    result = tenant_col.query.fetch_objects(
+        filters=wvq.Filter.by_property("attachmentId").equal(attachment_id),
+        limit=1,
+        return_properties=["contentHash"],
+    )
+    if result.objects:
+        return result.objects[0].properties.get("contentHash") or None
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -69,21 +69,30 @@ class ComponentScores(BaseModel):
     duplication: int | None = None
 
 
-class SimilarFile(BaseModel):
-    attachment_id: str = Field(..., alias="attachmentId")
-    similarity: float
-
-    model_config = {"populate_by_name": True}
-
-
 class AnalyzeDetails(BaseModel):
     component_scores: ComponentScores | None = Field(default=None, alias="componentScores")
-    similar_files: list[SimilarFile] = Field(default_factory=list, alias="similarFiles")
     cache_hit: bool = Field(default=False, alias="cacheHit")
     degraded: bool = Field(
         default=False,
         description="True when one or more dependencies (Weaviate/OpenAI) were unreachable.",
     )
+
+    model_config = {"populate_by_name": True}
+
+
+class SimilarFileEntry(BaseModel):
+    attachment_id: str = Field(..., alias="attachmentId")
+    file_name: str = Field(default="", alias="fileName")
+    plan_id: str = Field(default="", alias="planId")
+    similarity: float
+    exact_duplicate: bool = Field(default=False, alias="exactDuplicate")
+
+    model_config = {"populate_by_name": True}
+
+
+class SimilarFilesResponse(BaseModel):
+    attachment_id: str = Field(..., alias="attachmentId")
+    similar: list[SimilarFileEntry] = Field(default_factory=list)
 
     model_config = {"populate_by_name": True}
 
@@ -119,12 +128,22 @@ class AnalyzeResultEnvelope(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Rescan / backfill: POST /v1/integrity/rescan
+# Permanent removal: DELETE /v1/integrity/attachments
 # ---------------------------------------------------------------------------
-class RescanRequest(BaseModel):
-    attachment_ids: list[str] | None = Field(default=None, alias="attachmentIds")
+class DeleteAttachmentsRequest(BaseModel):
     tenant_key: str | None = Field(default=None, alias="tenantKey")
-    force: bool = False
+    attachment_ids: list[str] | None = Field(default=None, alias="attachmentIds")
+
+    model_config = {"populate_by_name": True}
+
+
+class DeleteAttachmentsResponse(BaseModel):
+    deleted: int = Field(default=0, description="Attachments that had data purged.")
+    not_found: int = Field(
+        default=0,
+        alias="notFound",
+        description="Attachments with no cached verdict to remove (already absent).",
+    )
 
     model_config = {"populate_by_name": True}
 

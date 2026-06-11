@@ -83,9 +83,11 @@ under. That's why it's an "AI service."
    │            Ready2Go AI Service  (this repo)              │
    │            FastAPI (Python), runs on port 8000           │
    │                                                          │
-   │  /v1/integrity/analyze   ← score one document           │
-   │  /v1/integrity/rescan    ← clear cache / re-run          │
-   │  /v1/audit/summary       ← org-wide audit narrative      │
+   │  POST   /v1/integrity/analyze        ← queue scoring (202)│
+   │  GET    /v1/integrity/result/{id}    ← poll the verdict   │
+   │  GET    /v1/integrity/similar/{id}   ← live duplicates    │
+   │  DELETE /v1/integrity/attachments    ← purge documents    │
+   │  POST   /v1/audit/summary            ← org audit narrative│
    │  /healthz /readyz /metrics /v1/diagnostics/calls         │
    └───┬──────────────┬───────────────┬─────────────────────┘
        │              │               │
@@ -217,13 +219,22 @@ remove Weaviate and the service can no longer score anything meaningfully.
 | Collection | Key | Purpose |
 |------------|-----|---------|
 | `ai_analysis_cache` | unique `(contentHash, modelVersion)` | Dedup cache of final verdicts (status/score/summary/components). A hit = 0 tokens. Also stores `vectorIds` — the Weaviate chunk-object UUIDs for this document, as a direct reference to its vectors. |
-| `ai_audit_state` | `_id = tenantKey` | Per‑customer rolling counters (totals, integrity breakdown, score sum) plus two per‑doc lists — `notable` (worst‑20) and `all_analyzed` (every doc) — each entry holding `{fileName, status, score, planId, summary}` (summary excerpt ≤600 chars). Updated O(1) per analyze. Powers the audit endpoint without re‑scanning anything. |
+| `ai_audit_state` | `_id = tenantKey` | Per‑customer audit state. Holds a **per‑attachment `documents` map** keyed by `attachmentId` (one entry per document: `{category, status, score, fileName, planId, summary‑excerpt ≤600 chars, updatedAt}`). All audit aggregates (`counts`, `integrity`, `scoreSum`, `scoreCount`, `all_analyzed`, `notable`) are **derived on read** — there are no stored counters. Re‑analysing an attachment **replaces** its entry (idempotent, never double‑counted); deleting one `$unset`s it (it actually leaves the audit). Powers the audit endpoint without re‑scanning anything. |
 | `ai_call_log` | auto, sorted by `ts` | Append‑only record of every OpenAI call (kind, model, tokens, latency, success/error) for cost tracking and debugging. |
 | `ai_analysis_jobs` | `_id = attachmentId` | Async analyze job status: `state` (processing/done/error), the finished `result` payload, and `detail` on error. Backs the `/analyze` (202) → `/result` polling flow. Stale `processing` jobs are reaped to `error` on startup. |
 
+> **Why a per-attachment map instead of `$inc` counters?** The earlier design used rolling `$inc`
+> counters plus append‑only `notable`/`all_analyzed` lists. That could double‑count a re‑analysed
+> document (so a derived average could drift above 100) and couldn't truly remove a deleted file.
+> The current map is **idempotent** (re‑analyze replaces the entry), **removable** (`$unset` on
+> delete), and **bounded** (exactly one entry per attachment). A legacy compatibility path still
+> reads old documents (deduping the old `all_analyzed` list by `fileName`) until they're re‑analysed.
+
 > **Ownership boundary:** MongoDB's `ready2go` database is **shared** with the Next.js app. Next.js
 > owns the business documents (`continuityplans`, `continuityauditreports`); this Python service
-> only ever reads/writes its own `ai_*` collections. They never step on each other.
+> only ever reads/writes its own `ai_*` collections (and **reads** nothing of Next.js's at request
+> time). They never step on each other. Exact field‑level schemas for every collection are in
+> [§11](#11-where-all-data-lives).
 
 ---
 
@@ -238,7 +249,7 @@ This is what happens when Next.js calls `POST /v1/integrity/analyze`. The orches
  3. Cache check (contentHash, modelVersion)
         └─ HIT  → return cached verdict immediately (0 tokens) ──► DONE
         └─ MISS → continue
- ── steps 4–11 run inside a REQUEST_TIMEOUT_S timeout + catch-all guard ──
+ ── steps 4–11 run in the background inside an ANALYZE_TIMEOUT_S timeout + catch-all guard ──
  4. Extract text + quality                (ingest/extract.py)
  5. Chunk text into overlapping chunks    (ingest/chunk.py; MAX_CHUNKS_PER_DOC, 0=unlimited)
  6. Embed all chunks in ONE batched call  (llm/embeddings.py → OpenAI)
@@ -255,17 +266,19 @@ This is what happens when Next.js calls `POST /v1/integrity/analyze`. The orches
 
 - **Cache short‑circuit (step 3).** If the file's content hash is already cached for this model
   version, steps 4–11 are skipped entirely. The response has `details.cacheHit = true` and costs
-  nothing. (Note: a cache‑hit response returns the stored component scores but an **empty**
-  `similarFiles` list — siblings are only computed on a full run.)
+  nothing. (Similar/duplicate files are no longer part of the analyze response at all — they are
+  served live from [`GET /v1/integrity/similar/{attachmentId}`](#92-get-v1integritysimilarattachmentid--live-similarduplicate-files).)
 
-- **Timeout + graceful fallback.** Steps 4–11 run inside `asyncio.wait_for(..., timeout=request_timeout_s)`
-  (set by `REQUEST_TIMEOUT_S`, default 25s). On **timeout** or any **unexpected exception**, the service does **not**
-  return a 500. Instead it returns a safe fallback: `status="Under Review"`, `score=50`,
-  `summary="Analysis unavailable — will retry on next request."`, `degraded=true`. Next.js can
-  show the document as "still being reviewed" rather than erroring.
+- **Timeout + graceful fallback.** Since `/analyze` is **async**, the pipeline (steps 4–11) runs in
+  the background inside `asyncio.wait_for(..., timeout=analyze_timeout_s)` (set by `ANALYZE_TIMEOUT_S`,
+  default 300s — more generous than the legacy synchronous `REQUEST_TIMEOUT_S` because no client is
+  blocked). On **timeout** or any **unexpected exception**, the job still resolves to **`state:"done"`**
+  with a graceful degraded `result` (`degraded=true`) rather than `error`, so Next.js can show the
+  document as "still being reviewed" rather than failing.
 
-- **Fetch failure is the one hard error.** If the file can't be downloaded (step 2), the service
-  returns **HTTP 502 Bad Gateway** — there's nothing to analyse.
+- **Fetch failure surfaces as a job error.** If the file can't be downloaded (step 2), the background
+  job resolves to **`state:"error"`** on `/result` with an explanatory `detail` (this replaces the old
+  synchronous **HTTP 502**). Re‑submit `/analyze` to retry.
 
 - **Degraded ≠ empty.** "Degraded" specifically means *a dependency we needed was unreachable*:
   - `embed_failed` — we had text but OpenAI embeddings failed.
@@ -526,7 +539,6 @@ no cached verdict.
     "modelVersion": "integrity-v1",
     "details": {
       "componentScores": { "content": 71, "name": 40, "quality": 95, "duplication": 100 },
-      "similarFiles": [ { "attachmentId": "att_009", "similarity": 0.81 } ],
       "cacheHit": false,
       "degraded": false
     }
@@ -558,7 +570,6 @@ When `state` is `done`, `result` holds the verdict:
   "modelVersion": "integrity-v1",
   "details": {
     "componentScores": { "content": 71, "name": 40, "quality": 95, "duplication": 100 },
-    "similarFiles": [ { "attachmentId": "att_009", "similarity": 0.81 } ],
     "cacheHit": false,
     "degraded": false
   }
@@ -579,7 +590,6 @@ When `state` is `done`, `result` holds the verdict:
 | Field | Alias | Type | Meaning | UI Tooltip (ℹ️ on hover) |
 |-------|-------|------|---------|--------------------------|
 | `component_scores` | `componentScores` | object\|null | Per‑signal 0–100 breakdown (`content`,`name`,`quality`,`duplication`), each int or null. | "The four individual scores (0–100) that make up the overall score — so you can see *why* a document scored the way it did. See each sub‑score's tooltip below." |
-| `similar_files` | `similarFiles` | array | Up to **3** `{attachmentId, similarity}` siblings (empty on a cache hit / when no centroid). | "Other files in the same plan that look most similar to this one (with a 0–1 similarity). Useful for spotting duplicates or related documents." |
 | `cache_hit` | `cacheHit` | bool | True if served from cache (0 tokens). | "True means we recognised this exact file from a previous check and returned the saved result instantly — no re‑processing needed." |
 | `degraded` | `degraded` | bool | True if a needed dependency was unreachable; result not cached. | "True means a temporary system issue (AI or vector service unavailable) made this result provisional. It wasn't saved and will be recalculated on the next try." |
 
@@ -594,30 +604,91 @@ The four **component scores** (each 0–100) have their own tooltips:
 
 ---
 
-### 9.2 `POST /v1/integrity/rescan` — clear cache / re‑run
+### 9.2 `GET /v1/integrity/similar/{attachmentId}` — live similar/duplicate files
 
-Prepares one or more attachments to be re‑analysed (e.g. after a model bump or a known bad result).
-Returns **HTTP 202 Accepted**. It does **not** re‑analyse inline — it deletes the cache entry (and
-Weaviate chunks) so the next `/analyze` call rebuilds everything.
+Returns the files most similar to one attachment, computed **live** against Weaviate (not stored on
+the analyze result). Use it to power a "duplicates / related documents" panel. Returns **HTTP 200**
+with a (possibly empty) list — it **never 500s** (on any vector‑store error it logs and returns a
+partial/empty list) and **never returns stale results** (deleted files are gone from Weaviate, so
+they can't appear).
 
-#### Request body: `RescanRequest`
+**Query/path params:**
 
-| Field | Alias | Type | Req | Meaning | UI Tooltip (ℹ️ on hover) |
-|-------|-------|------|-----|---------|--------------------------|
-| `attachment_ids` | `attachmentIds` | string[]\|null | ❌ | Documents to reprocess. If empty/missing → no‑op. | "The list of files to re‑check. They'll be re‑analysed fresh the next time they're opened." |
-| `tenant_key` | `tenantKey` | string\|null | ❌* | Tenant; required (non‑blank) for the Weaviate chunk delete. | "Which customer these files belong to." |
-| `force` | — | bool | ❌ (default `false`) | `false`: skip attachments already cached. `true`: delete cache and re‑run regardless. | "Turn on to force a complete re‑analysis even if we already have a saved result. Leave off to only re‑check files that haven't been analysed yet." |
+| Param | In | Type | Req | Meaning |
+|-------|-----|------|-----|---------|
+| `attachmentId` | path | string | ✅ | The document to find neighbours for. |
+| `tenantKey` | query | string | ✅ | Tenant scope (`"sub_"+ownerUserId`). Blank → **HTTP 400**. |
 
-#### Response
+**How it works (two tiers, results merged & de‑duplicated):**
+
+1. **Exact duplicates** — looks up this attachment's `contentHash` (from the cache, else from any
+   stored chunk) and finds other attachments in the same tenant sharing that hash. These come back
+   with `similarity = 1.0` and `exactDuplicate = true`.
+2. **Semantic near‑duplicates** — computes the document's centroid and runs a vault‑wide
+   `near_vector` search (across all the tenant's plans), filtered to the current `modelVersion`.
+   Matches below `SIMILAR_MIN_SIMILARITY` (default `0.55`) are dropped; an attachment already found
+   as an exact duplicate is not repeated.
+
+Results are sorted by `similarity` descending and capped at `SIMILAR_MAX_RESULTS` (default `5`).
+
+#### Response body: `SimilarFilesResponse`
 
 ```json
-{ "scheduled": 3, "skipped": 1,
-  "message": "Rescan prepared for 3 attachment(s). They will be re-analyzed on the next /analyze call. (1 skipped — already cached; use force=true to override.)" }
+{
+  "attachmentId": "att_001",
+  "similar": [
+    { "attachmentId": "att_009", "fileName": "bcp_v2.pdf", "planId": "plan_abc", "similarity": 1.0,  "exactDuplicate": true },
+    { "attachmentId": "att_042", "fileName": "recovery.pdf", "planId": "plan_xyz", "similarity": 0.78, "exactDuplicate": false }
+  ]
+}
 ```
+
+| Field | Alias | Type | Meaning | UI Tooltip (ℹ️ on hover) |
+|-------|-------|------|---------|--------------------------|
+| `attachment_id` | `attachmentId` | string | Echoes the queried document. | "The file these matches were found for." |
+| `similar` | — | array | The matched files (see below), best first. | "Other files across the account that look like this one." |
+| ↳ `attachment_id` | `attachmentId` | string | The matched document's id. | "The matching file." |
+| ↳ `file_name` | `fileName` | string | The matched file's name. | "The matching file's name." |
+| ↳ `plan_id` | `planId` | string | The plan the match is filed under. | "Which plan the matching file belongs to." |
+| ↳ `similarity` | — | float 0–1 | `1.0` for an exact byte duplicate, else cosine similarity. | "How similar this file is (1.0 = an exact duplicate)." |
+| ↳ `exact_duplicate` | `exactDuplicate` | bool | True if byte‑for‑byte identical (same `contentHash`). | "True means this is the exact same file (identical contents)." |
 
 ---
 
-### 9.3 `POST /v1/audit/summary` — org‑wide audit narrative
+### 9.3 `DELETE /v1/integrity/attachments` — permanently purge documents
+
+Call this when a subadmin **deletes** a document. For each `attachmentId` it removes, within the
+tenant's scope: the `ai_analysis_cache` verdict(s), the per‑attachment entry in `ai_audit_state`
+(so the doc actually leaves the audit), the `ai_analysis_jobs` row (so `/result` 404s afterwards),
+and the document's chunks/vectors in Weaviate. Returns **HTTP 200**. Each id is purged
+independently — one failure does not abort the rest (Weaviate delete failures are logged but the
+Mongo purge still counts).
+
+> **This replaces the old `POST /v1/integrity/rescan` endpoint** (now removed). To *re‑run* analysis
+> instead of deleting, call `DELETE /attachments` (which clears the cache) and then `POST /analyze`
+> again — a cleared cache forces a fresh pipeline.
+
+#### Request body: `DeleteAttachmentsRequest`
+
+| Field | Alias | Type | Req | Meaning | UI Tooltip (ℹ️ on hover) |
+|-------|-------|------|-----|---------|--------------------------|
+| `attachment_ids` | `attachmentIds` | string[]\|null | ❌ | Documents to purge. Empty/missing → no‑op (`{deleted:0, notFound:0}`). | "The files to remove from the AI service entirely." |
+| `tenant_key` | `tenantKey` | string\|null | ✅ (non‑blank) | Tenant scope. Blank → **HTTP 400**. | "Which customer these files belong to." |
+
+#### Response body: `DeleteAttachmentsResponse`
+
+```json
+{ "deleted": 2, "notFound": 1 }
+```
+
+| Field | Alias | Type | Meaning |
+|-------|-------|------|---------|
+| `deleted` | — | int | Attachments that had a cached verdict removed. |
+| `not_found` | `notFound` | int | Attachments that had no cached verdict to remove (already absent). |
+
+---
+
+### 9.4 `POST /v1/audit/summary` — org‑wide audit narrative
 
 Builds a bounded summary from the rolling per‑tenant counters (`ai_audit_state`). Next.js supplies
 aggregate context in the body; the service primarily uses the stored rolling state for the tenant.
@@ -655,7 +726,7 @@ Top‑level fields:
 | `totals` | — | `AuditTotals` | ✅ | `{plans, attachments, analyzed}` (ints, default 0). | "Headline counts: how many plans and files exist, and how many have been analysed so far." |
 | `average_score` | `averageScore` | int | ❌ (default 0) | Org average supplied by Next.js. | "The average integrity score across all analysed files — a quick health number for the whole account." |
 | `counts` | — | `AuditCounts` | ✅ | `{coop, bcp, compliance, response}` (ints). | "How many files fall into each plan type (COOP, BCP, Compliance, Response)." |
-| `integrity` | — | `IntegrityBreakdown` | ✅ | `{compliant, underReview, nonCompliant, unanalyzed}` (ints). Keys match the verdict vocabulary. **Legacy keys `{inSync, reviewing, deviation}` are NOT accepted** (hard cutover — send the new keys, see §9.5). | "How many files landed in each verdict bucket: Compliant, Under Review, Non-Compliant, and not‑yet‑analysed." |
+| `integrity` | — | `IntegrityBreakdown` | ✅ | `{compliant, underReview, nonCompliant, unanalyzed}` (ints). Keys match the verdict vocabulary. **Legacy keys `{inSync, reviewing, deviation}` are NOT accepted** (hard cutover — send the new keys, see §9.6). | "How many files landed in each verdict bucket: Compliant, Under Review, Non-Compliant, and not‑yet‑analysed." |
 | `plans` | — | `AuditPlan[]` | ❌ (default `[]`) | Plan‑level detail (see below). | "Per‑plan breakdown used to write the audit narrative." |
 
 `AuditPlan`:
@@ -699,7 +770,7 @@ Top‑level fields:
 
 ---
 
-### 9.4 Operational endpoints
+### 9.5 Operational endpoints
 
 | Method & path | Auth | Returns |
 |---------------|------|---------|
@@ -710,7 +781,7 @@ Top‑level fields:
 
 ---
 
-### 9.5 Migration notes — expected Next.js changes
+### 9.6 Migration notes — expected Next.js changes
 
 Two contract changes landed together. Both are **backward‑compatible for now**, so Next.js can
 migrate at its own pace, but the old shapes are deprecated.
@@ -751,6 +822,16 @@ migrate at its own pace, but the old shapes are deprecated.
   scores narrated).
 - **UI:** the per‑doc `summary` now contains newlines. Render it preserving line breaks
   (e.g. CSS `white-space: pre-line`) so the three sections display correctly in the demo.
+
+**4. Endpoint changes — ⚠️ `/rescan` removed; `similarFiles` moved out of the analyze result.**
+
+- **`POST /v1/integrity/rescan` is removed.** To purge a document use **`DELETE /v1/integrity/attachments`**
+  (`{tenantKey, attachmentIds[]}` → `{deleted, notFound}`); to re‑run, delete then `POST /analyze`
+  again. See [§9.3](#93-delete-v1integrityattachments--permanently-purge-documents).
+- **`details.similarFiles` no longer exists on the analyze response.** Duplicate/related files are
+  now fetched live from **`GET /v1/integrity/similar/{attachmentId}?tenantKey=`**, which also returns
+  richer entries (`fileName`, `planId`, `exactDuplicate`) and detects exact byte duplicates. See
+  [§9.2](#92-get-v1integritysimilarattachmentid--live-similarduplicate-files).
 
 ---
 
@@ -811,10 +892,152 @@ EdDSA) tokens validated against a JWKS endpoint, used **in addition to** TLS and
 |------|--------|-------------------|-------------------|------------------|
 | **Document chunks + vectors** | Weaviate | `/var/lib/weaviate` inside the container; on the host it's the named `weaviate_data` volume, or any path you set via **`WEAVIATE_DATA_PATH`** (bind mount onto another drive / NFS / cloud) | ✅ survives `docker compose down`; **deleted** only by `down -v` | ✅ `DocChunk` is multi‑tenant (`sub_<ownerUserId>`) |
 | **Result cache** | MongoDB Atlas | `ready2go.ai_analysis_cache` | ✅ (Atlas‑managed, backed up) | by content hash (tenant‑agnostic) |
-| **Rolling audit state** | MongoDB Atlas | `ready2go.ai_audit_state` (`_id = tenantKey`) | ✅ | ✅ one doc per tenant |
+| **Audit state** (per‑attachment map) | MongoDB Atlas | `ready2go.ai_audit_state` (`_id = tenantKey`) | ✅ | ✅ one doc per tenant |
+| **Analyze jobs** (async state) | MongoDB Atlas | `ready2go.ai_analysis_jobs` (`_id = attachmentId`) | ✅ | carries `tenantKey` |
 | **AI call log** | MongoDB Atlas | `ready2go.ai_call_log` | ✅ | appended (carries `attachmentId`) |
 | **App logs (all levels)** | Filesystem | `${LOG_DIR}/app.log` (default `${DATA_DIR}/logs`; JSON, rotating 10 MB × 5). Disabled entirely by `LOG_TO_FILE=false` | ⚠️ **ephemeral in container** unless `LOG_DIR`/`DATA_DIR` points at a mounted path | n/a |
 | **Error logs (WARNING+)** | Filesystem | `${LOG_DIR}/error.log` (same controls as above) | ⚠️ ephemeral in container unless mounted | n/a |
+
+### 11.1 MongoDB `ai_*` collection schemas (field‑by‑field)
+
+These four collections live in the `ready2go` database and are **owned exclusively by this Python
+service**. Field names are taken verbatim from the code (`app/store/*`). Next.js may read them for
+diagnostics but must never write them.
+
+**`ai_analysis_cache`** — dedup cache of final verdicts (`app/store/cache.py`).
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `attachmentId` | string | The document id this verdict belongs to. |
+| `contentHash` | string | SHA‑256 of the file bytes. Half of the unique cache key. |
+| `modelVersion` | string | e.g. `integrity-v1`. Other half of the cache key — bumping it invalidates all entries. |
+| `status` | string | `Compliant` \| `Under Review` \| `Non-Compliant`. |
+| `score` | int (0–100) | Composite integrity score. |
+| `summary` | string (≤2000) | The full per‑doc 3‑section summary. |
+| `scoreComponents` | object | `{content, name, quality, duplication}` — each int 0–100. |
+| `vectorIds` | string[] | Weaviate chunk‑object UUIDs for this document (direct reference to its vectors). |
+| `analyzedAt` | datetime (UTC) | When the verdict was produced/last upserted. |
+
+**Indexes:** unique `(contentHash, modelVersion)` (name `cache_hash_model`); non‑unique `attachmentId`.
+
+**`ai_audit_state`** — per‑tenant audit state, one document per tenant (`app/store/aggregate.py`).
+
+```
+{
+  _id:        <tenantKey>,                 # "sub_" + ownerUserId
+  documents: {                             # the source of truth — one entry per attachment
+    "<attachmentId>": {
+      category:  "coop" | "bcp" | "compliance",
+      status:    "Compliant" | "Under Review" | "Non-Compliant",
+      score:     <int 0-100>,
+      fileName:  <string>,
+      planId:    <string>,
+      summary:   <string ≤600 chars>,      # excerpt only; full summary lives in ai_analysis_cache
+      updatedAt: <datetime UTC>
+    },
+    ...
+  },
+  updatedAt:  <datetime UTC>
+}
+```
+
+All audit aggregates the summary endpoint needs — `counts {coop,bcp,compliance,response}`,
+`integrity {compliant,underReview,nonCompliant,unanalyzed}`, `scoreSum`, `scoreCount`,
+`all_analyzed[]`, and `notable[]` (worst scorers, score < 60, capped at 20) — are **computed on
+read** from `documents`; none are stored. **Indexes:** `_id` only (it *is* the tenant key).
+
+**`ai_call_log`** — append‑only OpenAI call trail (`app/store/calllog.py`). Best‑effort: a write
+failure never breaks a request.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `ts` | datetime (UTC) | When the call happened. |
+| `kind` | string | `embed` \| `chat`. |
+| `attachmentId` | string | Document the call was for (may be empty for non‑attachment calls). |
+| `model` | string | OpenAI model name used. |
+| `tokens` | int | Total tokens (0 on failure). |
+| `latency_ms` | number | Wall‑clock latency. |
+| `success` | bool | Whether the call succeeded. |
+| `error` | string \| null | Error message on failure. |
+
+**Indexes:** `ts` descending; `attachmentId`.
+
+**`ai_analysis_jobs`** — async analyze job tracking, one document per attachment (`app/store/jobs.py`).
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `_id` | string | The `attachmentId` (so a new submit overwrites the prior run). |
+| `tenantKey` | string | Tenant that owns the job. |
+| `modelVersion` | string | Model version the job ran under. |
+| `state` | string | `processing` \| `done` \| `error`. |
+| `result` | object \| null | The full `AnalyzeResponse` payload (camelCase) when `state = done`. |
+| `detail` | string \| null | Human‑readable reason when `state = error`. |
+| `startedAt` | datetime (UTC) | When the job was queued. |
+| `updatedAt` | datetime (UTC) | Last state change (used by the stale‑job reaper). |
+
+**Indexes:** `_id`; compound `(state, updatedAt)` (name `jobs_state_updated`) for the startup reaper.
+
+### 11.2 Weaviate `DocChunk` collection schema
+
+`DocChunk` is **multi‑tenant** — one Weaviate tenant per customer, `tenantKey = "sub_" + ownerUserId`.
+Tenant A can never read tenant B's objects. Each object is one ~500‑token chunk plus its 1536‑dim
+OpenAI vector (the vector is supplied by us; the collection's vectorizer is `none`). Properties
+(`app/vectors/schema.py`):
+
+| Property | Type | Vectorized? | Meaning |
+|----------|------|-------------|---------|
+| `attachmentId` | text | yes | MongoDB document id; idempotency key for delete‑then‑insert. |
+| `planId` | text | yes | Plan the file is filed under (groups siblings for duplication). |
+| `category` | text | yes | `coop` \| `bcp` \| `compliance`. |
+| `fileName` | text | yes | Original filename. |
+| `contentHash` | text | **no** (`skip_vectorization`) | SHA‑256 of file bytes; powers exact‑duplicate detection in `/similar`. |
+| `chunkIndex` | int | yes | 0‑based position of the chunk in the document. |
+| `text` | text | yes | The chunk text (also BM25‑indexed). |
+| `modelVersion` | text | **no** (`skip_vectorization`) | e.g. `integrity-v1`; lets similarity search filter to the current model. |
+
+The UUIDs Weaviate assigns to the inserted chunk objects are returned by `upsert_chunks` and stored
+in `ai_analysis_cache.vectorIds`, so each cached verdict references its exact vectors.
+
+### 11.3 Next.js‑owned collections this service interacts with
+
+These belong to the **Next.js app** — the AI service never writes them at request time. They are
+documented here because the contract flows through them. The offline seed/prep scripts
+(`scripts/prep/*`) are the only place this repo writes them, and only against dev/staging.
+
+**`continuityplans`** — tenant‑aware (each document carries `ownerUserId`). One document per
+`(ownerUserId, planId)`. Shape (from `scripts/prep/seed_mongo.py` + the Next.js Mongoose model):
+
+```
+{
+  _id, ownerUserId (ObjectId → User), licenseId,
+  planId, label, overview,
+  category: "coop" | "bcp" | "compliance",      # never store "response" — it's UI-inferred
+  steps: [string],
+  attachments: [{
+    _id (ObjectId),                              # this is the attachmentId sent to the AI service
+    fileName, fileUrl,                           # fileUrl = Cloudinary secure_url (what we download)
+    size, uploadedAt,
+    cloudinaryPublicId, cloudinaryResourceType,  # "image" | "raw"
+    # ── the four fields Next.js writes FROM the AnalyzeResponse ──
+    aiIntegrityStatus,                           # "Compliant" | "Under Review" | "Non-Compliant"
+    aiIntegrityScore,                            # 0..100
+    aiIntegritySummary,                          # the 3-section summary (≤2000)
+    aiIntegrityAnalyzedAt                         # Date
+  }],
+  createdAt, updatedAt, __v
+}
+```
+
+**`continuityauditreports`** — where Next.js upserts the result of `POST /v1/audit/summary`
+(one report per subadmin/tenant): `{summary, findings[], posture, averageScore, totals, integrity, generatedAt}`.
+
+> **Hard cutoff — legacy shapes no longer accepted.** The older single‑tenant `EmergencyPlan`
+> collection, the singleton `ContinuityAudit` (`scope: "global"`), and the status strings
+> `In Sync` / `Reviewing` / `Deviation Found` (plus the audit keys `inSync` / `reviewing` /
+> `deviation`) are **retired**. Only the new tenant‑aware collections and the new vocabulary
+> (`Compliant` / `Under Review` / `Non-Compliant`; `compliant` / `underReview` / `nonCompliant` /
+> `unanalyzed`) are accepted. See [§9.6](#96-migration-notes--expected-nextjs-changes) and the
+> mapping in the Next.js integration guide.
 
 ### Docker topology — `docker-compose.yml`
 - **`api`** — this service, port `8000`, env from `.env`, overrides `WEAVIATE_URL=http://weaviate:8080`,
@@ -916,8 +1139,16 @@ All settings are environment variables, loaded once and cached by `get_settings(
 | `ANALYZE_TIMEOUT_S` | `300.0` | Max seconds a single background analyze run may take before settling on a graceful degraded result. More generous than `REQUEST_TIMEOUT_S` because no client is blocked — the caller is polling. |
 | `JOB_STALE_SECONDS` | `600` | On startup, analyze jobs left in `processing` longer than this (e.g. from a crash mid‑run) are flipped to `error` so pollers aren't stuck forever. |
 | `LLM_JUDGE_BAND` | `60,72` | The borderline score range (`low,high`) where the cheap rule‑based score is uncertain, so the service spends an extra AI call to double‑check the verdict. Widen it to use the AI judge more often (more accurate, more cost); narrow/disable to save money. |
+| `SIMILAR_MIN_SIMILARITY` | `0.55` | The `GET /v1/integrity/similar/{id}` endpoint only returns **semantic** matches at or above this cosine similarity (0–1). Raise it to show only very close matches; lower it to surface looser relations. Exact byte‑duplicates (similarity `1.0`) always pass regardless. |
+| `SIMILAR_MAX_RESULTS` | `5` | Maximum number of entries `GET /v1/integrity/similar/{id}` returns (after merging exact duplicates + semantic matches and sorting by similarity). |
 | `PARSER_BACKEND` | `basic` | Which engine extracts text from files. `basic` = built‑in pure‑Python readers (PDF/DOCX/XLSX/CSV), no OCR. `liteparse` is reserved for a future OCR‑capable backend (reads scanned/image PDFs). Leave as `basic` unless OCR is added. |
 | Cloudinary / Seed vars | — | `CLOUDINARY_*` and `SEED_*` are used only by **offline seed/prep scripts** to create dev/staging test data — they are never read on the live request path. Ignore them for normal operation. |
+
+> **Note — `.env.example` drift.** `.env.example` does not yet list every knob the code reads. The
+> async‑pipeline vars (`ANALYZE_CONCURRENCY`, `ANALYZE_TIMEOUT_S`, `JOB_STALE_SECONDS`) and the
+> similar‑files vars (`SIMILAR_MIN_SIMILARITY`, `SIMILAR_MAX_RESULTS`) all have safe defaults in
+> `app/config.py`, so the service runs fine without them — but add them to `.env.example` when you
+> next touch it so the template stays complete.
 
 ---
 
@@ -938,7 +1169,7 @@ Every Python module under `app/`, its role, and key functions. (Who/what/why per
 ### `app/api/` — HTTP routes
 | File | Role |
 |------|------|
-| [app/api/integrity.py](../app/api/integrity.py) | `POST /v1/integrity/analyze` (the 12‑step pipeline, timeout + graceful fallback) and `POST /v1/integrity/rescan`. Orchestrates fetch→extract→chunk→embed→upsert→score→judge→summarize→persist. |
+| [app/api/integrity.py](../app/api/integrity.py) | `POST /v1/integrity/analyze` (queues the 12‑step pipeline, 202), `GET /v1/integrity/result/{id}` (poll), `GET /v1/integrity/similar/{id}` (live two‑tier duplicate search), `DELETE /v1/integrity/attachments` (purge cache+audit+jobs+vectors). The background pipeline orchestrates fetch→extract→chunk→embed→upsert→score→judge→summarize→persist with a timeout + graceful degraded fallback. |
 | [app/api/audit.py](../app/api/audit.py) | `POST /v1/audit/summary` — reads rolling state, builds bounded narrative, marks state clean. |
 | [app/api/health.py](../app/api/health.py) | `/healthz`, `/readyz` (live dep probes), `/metrics` (in‑process counters + `record_request`), `/v1/diagnostics/calls` (auth‑gated call‑log reader). |
 
@@ -973,16 +1204,17 @@ Every Python module under `app/`, its role, and key functions. (Who/what/why per
 |------|------|
 | [app/vectors/client.py](../app/vectors/client.py) | Lazy singleton Weaviate v4 client (`get_client`), `ensure_collections()` bootstrap, `close_client()`. Vectorizer disabled — we supply OpenAI vectors. |
 | [app/vectors/schema.py](../app/vectors/schema.py) | Collection definitions: `DocChunk` (multi‑tenant) properties. |
-| [app/vectors/repo.py](../app/vectors/repo.py) | CRUD + similarity ops: `upsert_chunks` (returns inserted chunk UUIDs → stored in `ai_analysis_cache.vectorIds`), `delete_by_attachment`, `get_all_chunks` (paginated — reads every chunk, no fixed ceiling), `content_centroid`, `sibling_similarities`. Defines `StoredChunk`. |
+| [app/vectors/repo.py](../app/vectors/repo.py) | CRUD + similarity ops: `upsert_chunks` (returns inserted chunk UUIDs → stored in `ai_analysis_cache.vectorIds`), `delete_by_attachment`, `get_all_chunks` (paginated — reads every chunk, no fixed ceiling), `content_centroid`, `sibling_similarities` (plan‑scoped for duplication signal, or vault‑wide for `/similar`), `find_exact_duplicates` (by `contentHash`), `get_attachment_content_hash`, `ensure_tenant`. Defines `StoredChunk` and `SimilarityResult`. |
 
 ### `app/store/` — the MongoDB layer
 | File | Role |
 |------|------|
-| [app/store/models.py](../app/store/models.py) | Request‑path Mongo client + collection accessors (`get_cache_col`/`get_state_col`/`get_log_col`) and `ensure_indexes()`. Collection name constants. |
-| [app/store/cache.py](../app/store/cache.py) | `get()` / `put()` for `ai_analysis_cache` (the dedup cache). |
-| [app/store/aggregate.py](../app/store/aggregate.py) | `update()` (O(1) `$inc` of rolling counters + `$push` to `all_analyzed` and bounded `notable`, each entry carrying a ≤600‑char summary excerpt), `read()`, `mark_clean()` for `ai_audit_state`. |
-| [app/store/calllog.py](../app/store/calllog.py) | `append()` — one row per OpenAI call into `ai_call_log` (never raises). |
-| [app/store/mongo.py](../app/store/mongo.py) | Separate connection for **offline** prep/seed scripts; never imported by request‑path routes. |
+| [app/store/models.py](../app/store/models.py) | Request‑path Mongo client + collection accessors (`get_cache_col`/`get_state_col`/`get_log_col`/`get_jobs_col`) and `ensure_indexes()`. Collection name constants for all four `ai_*` collections. |
+| [app/store/cache.py](../app/store/cache.py) | `get()` (by content hash), `get_by_attachment()` (fallback for `/result`), and `put()` for `ai_analysis_cache` (the dedup cache). |
+| [app/store/aggregate.py](../app/store/aggregate.py) | `update()` (idempotent `$set documents.<attachmentId>` with a ≤600‑char summary excerpt — replaces, never double‑counts), `remove()` (`$unset` an attachment on delete), `read()` (derives `counts`/`integrity`/`scoreSum`/`scoreCount`/`all_analyzed`/`notable` from the `documents` map, with a legacy‑doc compat path) for `ai_audit_state`. |
+| [app/store/jobs.py](../app/store/jobs.py) | `ai_analysis_jobs` lifecycle for the async flow: `start()`/`complete()`/`fail()`/`get()`/`remove()` and `reap_stale()` (startup sweep of wedged `processing` jobs → `error`). |
+| [app/store/calllog.py](../app/store/calllog.py) | `append()` — one row per OpenAI call into `ai_call_log` (never raises; logs a WARNING on sink failure). |
+| [app/store/mongo.py](../app/store/mongo.py) | Separate connection for **offline** prep/seed scripts; accessors for the Next.js‑owned `continuityplans` / `continuityauditreports`. Never imported by request‑path routes. |
 
 ---
 
@@ -1071,6 +1303,6 @@ collection. See [§4](#4-what-is-a-doc-chunk).
 
 ---
 
-*This document reflects the service as implemented in the `develop` branch. When you change a
-schema field, an env var, a weight/band, or a pipeline step, update the matching section here so it
-stays the single source of truth.*
+*This document reflects the service as implemented on the `main` branch. When you change a
+schema field, an env var, a weight/band, a pipeline step, or an endpoint, update the matching
+section here so it stays the single source of truth.*

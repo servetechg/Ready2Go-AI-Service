@@ -141,6 +141,10 @@ class Settings(BaseSettings):
     band_under_review: int = 41
     # Borderline band that triggers the optional LLM judge, e.g. "60,72".
     llm_judge_band: str = "60,72"
+    # Similar-files endpoint: only show semantic matches at/above this cosine similarity,
+    # and cap how many entries are returned.
+    similar_min_similarity: float = 0.55
+    similar_max_results: int = 5
 
     # ---- Document parser backend ---------------------------------------
     # "basic" (default) uses pdfplumber/pypdf/docx/xlsx.

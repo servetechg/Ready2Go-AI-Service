@@ -1,7 +1,8 @@
 """Per-file integrity endpoints.
 
-POST /v1/integrity/analyze  — full 12-step pipeline per uploaded document.
-POST /v1/integrity/rescan   — backfill / re-run for one or more attachments.
+POST   /v1/integrity/analyze            — queue the pipeline (202); poll /result.
+GET    /v1/integrity/result/{id}        — poll an analyze job's state/result.
+DELETE /v1/integrity/attachments        — purge cache + audit entry + vectors for ids.
 
 Flow for /analyze (see PHASE_B_VECTOR_IMPLEMENTATION_PLAN.md §1):
   1. Validate AnalyzeRequest              (schemas.py)
@@ -46,8 +47,10 @@ from app.schemas import (
     AnalyzeResponse,
     AnalyzeResultEnvelope,
     ComponentScores,
-    RescanRequest,
-    SimilarFile,
+    DeleteAttachmentsRequest,
+    DeleteAttachmentsResponse,
+    SimilarFileEntry,
+    SimilarFilesResponse,
 )
 from app.scoring import integrity as scorer
 from app.scoring import signals as sig
@@ -67,8 +70,10 @@ router = APIRouter(
 
 log = structlog.get_logger(__name__)
 
-# Graceful fallback returned when the pipeline times out or hits an unexpected error.
-_FALLBACK_SUMMARY = "Analysis unavailable — will retry on next request."
+_DEGRADED_DETAIL = (
+    "Analysis could not complete — a dependency (vector store or AI) was "
+    "unavailable or the run timed out. Re-analyze to try again."
+)
 
 
 # Caps concurrent heavy pipelines so a burst of large PDFs can't exhaust memory;
@@ -169,6 +174,80 @@ async def result(attachment_id: str) -> AnalyzeResultEnvelope:
     )
 
 
+@router.get("/similar/{attachment_id}", response_model=SimilarFilesResponse)
+async def similar(attachment_id: str, tenantKey: str) -> SimilarFilesResponse:
+    """Return live similar-files for one attachment (vault-wide, two-tier).
+
+    Tier 1 — exact duplicates via contentHash (similarity=1.0, exactDuplicate=true).
+    Tier 2 — semantic near-duplicates via centroid near-vector search, filtered to
+    the current modelVersion. Never returns stale results: deleted files are absent
+    from Weaviate and will not appear. Never 500 — returns partial/empty on errors.
+    """
+    settings = get_settings()
+    tenant = tenantKey
+    _require_tenant(tenant)
+
+    cached = await run_in_threadpool(cache.get_by_attachment, attachment_id, settings.model_version)
+    content_hash = (cached or {}).get("contentHash") if cached else None
+
+    results: dict[str, SimilarFileEntry] = {}
+
+    try:
+        if not content_hash:
+            content_hash = await run_in_threadpool(
+                vec.get_attachment_content_hash, tenant, attachment_id
+            )
+
+        if content_hash:
+            for r in await run_in_threadpool(
+                vec.find_exact_duplicates, tenant, content_hash,
+                exclude_attachment_id=attachment_id,
+            ):
+                results[r.attachment_id] = SimilarFileEntry(
+                    attachment_id=r.attachment_id,
+                    file_name=r.file_name,
+                    plan_id=r.plan_id,
+                    similarity=1.0,
+                    exact_duplicate=True,
+                )
+
+        chunks = await run_in_threadpool(vec.get_all_chunks, tenant, attachment_id)
+        centroid = vec.content_centroid(chunks) if chunks else None
+        if centroid:
+            for r in await run_in_threadpool(
+                vec.sibling_similarities, tenant, centroid,
+                exclude_attachment_id=attachment_id,
+                plan_id=None,
+                model_version=settings.model_version,
+                limit=50,
+            ):
+                sim = round(r.similarity, 4)
+                if sim < settings.similar_min_similarity:
+                    continue
+                if r.attachment_id in results:
+                    continue
+                results[r.attachment_id] = SimilarFileEntry(
+                    attachment_id=r.attachment_id,
+                    file_name=r.file_name,
+                    plan_id=r.plan_id,
+                    similarity=sim,
+                    exact_duplicate=False,
+                )
+    except Exception as exc:
+        log.warning(
+            "similar.lookup_failed",
+            detail="Similar-files lookup hit a vector-store error; returning partial/empty list.",
+            attachment_id=attachment_id,
+            error=str(exc),
+        )
+
+    ordered = sorted(results.values(), key=lambda e: e.similarity, reverse=True)
+    return SimilarFilesResponse(
+        attachment_id=attachment_id,
+        similar=ordered[: settings.similar_max_results],
+    )
+
+
 async def _background_analyze(payload: AnalyzeRequest, settings: Any) -> None:
     """Run the analyze pipeline detached from the request, recording job state.
 
@@ -251,19 +330,18 @@ async def _background_analyze(payload: AnalyzeRequest, settings: Any) -> None:
                     total_latency_ms=round((time.perf_counter() - pipeline_start) * 1000, 1),
                     cache_hit=False,
                 )
-                await run_in_threadpool(
-                    jobs.complete, attachment_id, _to_jsonable(result_response)
-                )
+                if result_response.details and result_response.details.degraded:
+                    await run_in_threadpool(jobs.fail, attachment_id, _DEGRADED_DETAIL)
+                else:
+                    await run_in_threadpool(
+                        jobs.complete, attachment_id, _to_jsonable(result_response)
+                    )
             except TimeoutError:
                 log.error("pipeline.timeout", timeout_s=settings.analyze_timeout_s)
-                await run_in_threadpool(
-                    jobs.complete, attachment_id, _to_jsonable(_reviewing_fallback(model_version))
-                )
+                await run_in_threadpool(jobs.fail, attachment_id, _DEGRADED_DETAIL)
             except Exception as exc:
                 log.exception("pipeline.unexpected_error", error=str(exc))
-                await run_in_threadpool(
-                    jobs.complete, attachment_id, _to_jsonable(_reviewing_fallback(model_version))
-                )
+                await run_in_threadpool(jobs.fail, attachment_id, _DEGRADED_DETAIL)
         finally:
             structlog.contextvars.clear_contextvars()
 
@@ -445,8 +523,10 @@ async def _run_pipeline(
             try:
                 siblings = await run_in_threadpool(
                     vec.sibling_similarities,
-                    tenant, plan.plan_id, centroid,
+                    tenant, centroid,
                     exclude_attachment_id=attachment_id,
+                    plan_id=plan.plan_id,
+                    model_version=model_version,
                 )
                 if siblings:
                     nearest_sibling_dist = siblings[0].distance
@@ -592,6 +672,7 @@ async def _run_pipeline(
         await run_in_threadpool(
             aggregate.update,
             tenant,
+            attachment_id=attachment_id,
             category=plan.category,
             status=int_status,
             score=score,
@@ -622,30 +703,8 @@ async def _run_pipeline(
 
     # ------------------------------------------------------------------ #
     # 12. Return — Next.js writes aiIntegrity* fields                     #
+    # Similar files are now served live from GET /v1/integrity/similar/{id}
     # ------------------------------------------------------------------ #
-    similar: list[SimilarFile] = []
-    if centroid:
-        try:
-            sibs = await run_in_threadpool(
-                vec.sibling_similarities,
-                tenant, plan.plan_id, centroid,
-                exclude_attachment_id=attachment_id,
-            )
-            similar = [
-                SimilarFile(attachment_id=s.attachment_id, similarity=s.similarity)
-                for s in sibs[:3]
-            ]
-        except Exception as exc:
-            log.warning(
-                "pipeline.similar_files_failed",
-                detail=(
-                    "Could not look up similar sibling files for the response. The "
-                    "score and status are unaffected; the response simply returns an "
-                    "empty similarFiles list. Cause below."
-                ),
-                error=str(exc),
-            )
-
     return AnalyzeResponse(
         status=int_status,
         score=score,
@@ -654,93 +713,86 @@ async def _run_pipeline(
         model_version=model_version,
         details=AnalyzeDetails(
             component_scores=ComponentScores(**components),
-            similar_files=similar,
             cache_hit=False,
             degraded=degraded,
         ),
     )
 
 
-@router.post("/rescan", status_code=status.HTTP_202_ACCEPTED)
-async def rescan(payload: RescanRequest) -> dict[str, object]:
-    """Re-run analysis for given attachments (backfill).
+@router.delete("/attachments", response_model=DeleteAttachmentsResponse)
+async def delete_attachments(payload: DeleteAttachmentsRequest) -> DeleteAttachmentsResponse:
+    """Permanently purge everything the AI service knows about given attachments.
 
-    For each attachmentId, looks up the cached record and re-analyzes if
-    force=True or no cache entry exists.  v1 uses a synchronous bounded loop;
-    an async queue can be added when volume warrants.
+    For each attachmentId this removes, in the tenant's scope:
+      - the dedup verdict in `ai_analysis_cache`,
+      - the per-attachment entry in `ai_audit_state` (so it leaves the audit), and
+      - the document's chunks/vectors in Weaviate.
+
+    Use this when a subadmin deletes a document. To RE-RUN analysis instead, call this
+    then POST /analyze again (a cleared cache forces a fresh pipeline). Each id is purged
+    independently — one failure does not abort the rest.
     """
     if not payload.attachment_ids:
-        return {"scheduled": 0, "message": "No attachment IDs provided."}
+        return DeleteAttachmentsResponse(deleted=0, not_found=0)
 
     settings = get_settings()
     tenant = payload.tenant_key or ""
     _require_tenant(tenant)
 
-    scheduled = 0
-    skipped = 0
-
     from app.store.models import get_cache_col
 
-    def _find_cached(aid: str) -> object:
-        return get_cache_col().find_one({"attachmentId": aid}, {"_id": 1})
+    def _purge_mongo(aid: str) -> int:
+        # Returns the number of cache rows removed (0 → nothing was cached for this id).
+        removed = get_cache_col().delete_many({"attachmentId": aid}).deleted_count
+        aggregate.remove(tenant, aid)
+        jobs.remove(aid)  # drop the async job row so /result 404s after deletion
+        return removed
 
-    def _delete_cached(aid: str) -> None:
-        get_cache_col().delete_many({"attachmentId": aid})
+    deleted = 0
+    not_found = 0
 
     for attachment_id in payload.attachment_ids:
         try:
-            if not payload.force:
-                # Check if a valid cache entry exists; skip if found.
-                existing = await run_in_threadpool(_find_cached, attachment_id)
-                if existing:
-                    skipped += 1
-                    log.info("rescan.skipped_cached", attachment_id=attachment_id)
-                    continue
+            cache_removed = await run_in_threadpool(_purge_mongo, attachment_id)
 
-            # Delete cached entry so the next /analyze call re-runs the full pipeline.
-            await run_in_threadpool(_delete_cached, attachment_id)
-            # Also remove Weaviate chunks so they're re-embedded on next analyze.
             if settings.weaviate_url:
                 try:
                     await run_in_threadpool(vec.delete_by_attachment, tenant, attachment_id)
                 except Exception as exc:
                     log.warning(
-                        "rescan.weaviate_delete_failed",
+                        "delete.weaviate_failed",
                         detail=(
-                            "Cleared the Mongo cache entry but could not delete this "
-                            "attachment's existing chunks from Weaviate. The next "
-                            "/analyze deletes-then-inserts, so stale chunks are "
-                            "normally overwritten — but flag this if re-analysis "
-                            "looks wrong. Cause below."
+                            "Purged the Mongo cache + audit entry but could not delete this "
+                            "attachment's chunks from Weaviate. Re-run the delete or remove "
+                            "the chunks manually if they linger. Cause below."
                         ),
                         attachment_id=attachment_id,
                         error=str(exc),
                     )
 
-            scheduled += 1
-            log.info("rescan.scheduled", attachment_id=attachment_id, force=payload.force)
+            if cache_removed:
+                deleted += 1
+            else:
+                not_found += 1
+            log.info(
+                "delete.purged",
+                detail="Removed cache, audit-state entry, and vectors for this attachment.",
+                attachment_id=attachment_id,
+                cache_rows_removed=cache_removed,
+            )
 
         except Exception as exc:
             log.warning(
-                "rescan.error",
+                "delete.error",
                 detail=(
-                    "Failed to prepare a rescan for this attachment (cache lookup or "
-                    "delete raised). Skipping it and continuing with the rest. "
-                    "Cause below."
+                    "Failed to purge this attachment (Mongo or Weaviate delete raised). "
+                    "Skipping it and continuing with the rest. Cause below."
                 ),
                 attachment_id=attachment_id,
                 error=str(exc),
             )
 
-    return {
-        "scheduled": scheduled,
-        "skipped": skipped,
-        "message": (
-            f"Rescan prepared for {scheduled} attachment(s). "
-            f"They will be re-analyzed on the next /analyze call. "
-            f"({skipped} skipped — already cached; use force=true to override.)"
-        ),
-    }
+    return DeleteAttachmentsResponse(deleted=deleted, not_found=not_found)
 
 
 # ---------------------------------------------------------------------------
@@ -787,17 +839,3 @@ def _normalize_status(s: str) -> str:
     return "Under Review"
 
 
-def _reviewing_fallback(model_version: str) -> AnalyzeResponse:
-    """Return the graceful Under Review response when the pipeline fails or times out."""
-    return AnalyzeResponse(
-        status="Under Review",
-        score=50,
-        summary=_FALLBACK_SUMMARY,
-        analyzed_at=datetime.now(UTC),
-        model_version=model_version,
-        details=AnalyzeDetails(
-            component_scores=ComponentScores(),
-            cacheHit=False,
-            degraded=True,
-        ),
-    )

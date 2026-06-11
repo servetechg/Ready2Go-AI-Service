@@ -108,10 +108,6 @@ async def summary(payload: AuditSummaryRequest) -> AuditSummaryResponse:
             )
             result.degraded = True
 
-        # 5. Mark state clean.
-        if tenant:
-            await run_in_threadpool(aggregate.mark_clean, tenant)
-
         return result
 
     except Exception as exc:

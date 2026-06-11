@@ -79,6 +79,11 @@ def get(attachment_id: str) -> dict[str, Any] | None:
     return get_jobs_col().find_one({"_id": attachment_id})
 
 
+def remove(attachment_id: str) -> None:
+    """Delete the job row for *attachment_id* (called when the document is purged)."""
+    get_jobs_col().delete_one({"_id": attachment_id})
+
+
 def reap_stale(stale_seconds: int) -> int:
     """Flip jobs stuck in `processing` past *stale_seconds* to `error`.
 
