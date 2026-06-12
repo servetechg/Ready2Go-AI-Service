@@ -178,27 +178,53 @@ async def result(attachment_id: str) -> AnalyzeResultEnvelope:
 async def similar(attachment_id: str, tenantKey: str) -> SimilarFilesResponse:
     """Return live similar-files for one attachment (vault-wide, two-tier).
 
-    Tier 1 — exact duplicates via contentHash (similarity=1.0, exactDuplicate=true).
-    Tier 2 — semantic near-duplicates via centroid near-vector search, filtered to
-    the current modelVersion. Never returns stale results: deleted files are absent
-    from Weaviate and will not appear. Never 500 — returns partial/empty on errors.
+    Tier 1 — exact duplicates via contentHash, returned as the UNION of two sources so the
+    case survives a cache hit (where the new attachment has no Weaviate chunk):
+        a) Weaviate `find_exact_duplicates` — covers files that have stored chunks.
+        b) the Mongo `ai_audit_state` content-hash index (`aggregate.find_by_content_hash`)
+           — covers cache-hit files that were registered without re-embedding.
+      Both yield similarity=1.0, exactDuplicate=true.
+    Tier 2 — semantic near-duplicates via centroid near-vector search, filtered to the current
+    modelVersion. Never returns stale results: deleted files are removed from BOTH Weaviate and
+    the audit index, so they cannot appear. Never 500 — returns partial/empty on errors.
     """
     settings = get_settings()
     tenant = tenantKey
     _require_tenant(tenant)
 
-    cached = await run_in_threadpool(cache.get_by_attachment, attachment_id, settings.model_version)
-    content_hash = (cached or {}).get("contentHash") if cached else None
-
-    results: dict[str, SimilarFileEntry] = {}
-
+    # Resolve the queried attachment's contentHash. Order matters: the Mongo sources work even
+    # when the file has no Weaviate chunks (cache-hit files), which is the whole point here.
+    content_hash: str | None = None
     try:
+        cached = await run_in_threadpool(
+            cache.get_by_attachment, attachment_id, settings.model_version
+        )
+        content_hash = (cached or {}).get("contentHash") or None
+        if not content_hash:
+            content_hash = await run_in_threadpool(
+                aggregate.get_content_hash, tenant, attachment_id
+            )
         if not content_hash:
             content_hash = await run_in_threadpool(
                 vec.get_attachment_content_hash, tenant, attachment_id
             )
+    except Exception as exc:
+        log.warning(
+            "similar.hash_resolve_failed",
+            detail="Could not resolve the attachment's contentHash; exact-dup tiers may be skipped.",
+            attachment_id=attachment_id,
+            error=str(exc),
+        )
 
-        if content_hash:
+    results: dict[str, SimilarFileEntry] = {}
+
+    # The three tiers run under INDEPENDENT guards so a failure in one (e.g. Weaviate down)
+    # cannot suppress the others — in particular the Mongo content-hash index must still detect
+    # exact duplicates when the vector store is unavailable.
+
+    # Exact tier (a) — Weaviate chunks carrying this contentHash.
+    if content_hash:
+        try:
             for r in await run_in_threadpool(
                 vec.find_exact_duplicates, tenant, content_hash,
                 exclude_attachment_id=attachment_id,
@@ -210,7 +236,40 @@ async def similar(attachment_id: str, tenantKey: str) -> SimilarFilesResponse:
                     similarity=1.0,
                     exact_duplicate=True,
                 )
+        except Exception as exc:
+            log.warning(
+                "similar.exact_weaviate_failed",
+                detail="Weaviate exact-duplicate lookup failed; the Mongo index tier still runs.",
+                attachment_id=attachment_id,
+                error=str(exc),
+            )
 
+    # Exact tier (b) — Mongo content-hash index (catches cache-hit duplicates with no chunks).
+    if content_hash:
+        try:
+            for m in await run_in_threadpool(
+                aggregate.find_by_content_hash, tenant, content_hash,
+                exclude_attachment_id=attachment_id,
+            ):
+                if m["attachmentId"] in results:
+                    continue
+                results[m["attachmentId"]] = SimilarFileEntry(
+                    attachment_id=m["attachmentId"],
+                    file_name=m["fileName"],
+                    plan_id=m["planId"],
+                    similarity=1.0,
+                    exact_duplicate=True,
+                )
+        except Exception as exc:
+            log.warning(
+                "similar.exact_index_failed",
+                detail="Mongo content-hash index lookup failed; returning partial list.",
+                attachment_id=attachment_id,
+                error=str(exc),
+            )
+
+    # Semantic tier — centroid near-vector search (skipped for files with no chunks).
+    try:
         chunks = await run_in_threadpool(vec.get_all_chunks, tenant, attachment_id)
         centroid = vec.content_centroid(chunks) if chunks else None
         if centroid:
@@ -235,8 +294,8 @@ async def similar(attachment_id: str, tenantKey: str) -> SimilarFilesResponse:
                 )
     except Exception as exc:
         log.warning(
-            "similar.lookup_failed",
-            detail="Similar-files lookup hit a vector-store error; returning partial/empty list.",
+            "similar.semantic_failed",
+            detail="Semantic near-duplicate search failed; returning exact-tier results only.",
             attachment_id=attachment_id,
             error=str(exc),
         )
@@ -296,6 +355,43 @@ async def _background_analyze(payload: AnalyzeRequest, settings: Any) -> None:
                     ),
                     content_hash=content_hash,
                 )
+                # Register this attachment in the tenant audit-state even on a cache hit.
+                # This (a) keeps the org audit complete — a re-uploaded file is a real, distinct
+                # attachment that must be counted — and (b) records its contentHash in the
+                # authoritative tenant-scoped index so /similar can detect it as an exact
+                # duplicate WITHOUT any Weaviate chunk for the new id. See aggregate.update.
+                await run_in_threadpool(
+                    aggregate.update,
+                    tenant,
+                    attachment_id=attachment_id,
+                    category=payload.plan.category,
+                    status=cached["status"],
+                    score=cached["score"],
+                    file_name=payload.attachment.file_name,
+                    plan_id=payload.plan.plan_id,
+                    summary=cached["summary"],
+                    content_hash=content_hash,
+                )
+                # Enhancement: clone the stored chunk vectors from a same-tenant copy (if one
+                # exists) under the new attachmentId — zero OpenAI tokens — so the duplicate
+                # also gets a centroid and participates in semantic near-duplicate search.
+                try:
+                    await run_in_threadpool(
+                        _clone_vectors_on_cache_hit,
+                        tenant, attachment_id, content_hash, payload, model_version,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "pipeline.cache_hit_clone_failed",
+                        detail=(
+                            "Could not clone vectors for the cache-hit duplicate. Exact-duplicate "
+                            "detection still works via the Mongo content-hash index; only semantic "
+                            "search participation is missing for this copy. Cause below."
+                        ),
+                        attachment_id=attachment_id,
+                        error=str(exc),
+                    )
+
                 response = AnalyzeResponse(
                     status=cached["status"],
                     score=cached["score"],
@@ -679,6 +775,7 @@ async def _run_pipeline(
             file_name=att.file_name,
             plan_id=plan.plan_id,
             summary=summary_text,
+            content_hash=fetch_result.content_hash,
         )
 
     log.info(
@@ -805,6 +902,61 @@ def _require_tenant(tenant: str) -> None:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="tenantKey is required.",
         )
+
+
+def _clone_vectors_on_cache_hit(
+    tenant: str,
+    attachment_id: str,
+    content_hash: str,
+    payload: AnalyzeRequest,
+    model_version: str,
+) -> bool:
+    """Clone a same-tenant copy's stored chunk vectors under *attachment_id* (zero tokens).
+
+    On a cache hit the new attachment has no Weaviate chunks. If another attachment in the same
+    tenant already holds chunks for this exact contentHash, reuse THEIR vectors (no OpenAI
+    re-embedding) so the duplicate gets a centroid and joins semantic search. Returns True if it
+    cloned, False if there was no same-tenant source to clone from (e.g. a cross-tenant cache hit).
+    Runs in a threadpool; callers treat any exception as non-fatal.
+    """
+    dupes = vec.find_exact_duplicates(
+        tenant, content_hash, exclude_attachment_id=attachment_id, limit=1
+    )
+    if not dupes:
+        return False  # no local copy with chunks — nothing to clone, no local duplicate to show.
+
+    source_chunks = vec.get_all_chunks(tenant, dupes[0].attachment_id)
+    texts: list[str] = []
+    vectors: list[list[float]] = []
+    for c in source_chunks:
+        if c.vector:
+            texts.append(c.text)
+            vectors.append(c.vector)
+    if not vectors:
+        return False
+
+    vec.upsert_chunks(
+        tenant,
+        attachment_id,
+        texts,
+        vectors,
+        plan_id=payload.plan.plan_id,
+        category=payload.plan.category,
+        file_name=payload.attachment.file_name,
+        content_hash=content_hash,
+        model_version=model_version,
+    )
+    log.info(
+        "pipeline.cache_hit_vectors_cloned",
+        detail=(
+            "Cloned chunk vectors from a same-tenant identical file under the new attachment id "
+            "(zero embedding tokens) so the duplicate participates in semantic search."
+        ),
+        attachment_id=attachment_id,
+        source_attachment_id=dupes[0].attachment_id,
+        chunk_count=len(vectors),
+    )
+    return True
 
 
 def _make_log(attachment_id: str) -> _LogCall:

@@ -265,9 +265,16 @@ This is what happens when Next.js calls `POST /v1/integrity/analyze`. The orches
 ### Key behaviours to understand
 
 - **Cache short‑circuit (step 3).** If the file's content hash is already cached for this model
-  version, steps 4–11 are skipped entirely. The response has `details.cacheHit = true` and costs
-  nothing. (Similar/duplicate files are no longer part of the analyze response at all — they are
-  served live from [`GET /v1/integrity/similar/{attachmentId}`](#92-get-v1integritysimilarattachmentid--live-similarduplicate-files).)
+  version, the heavy work (extract/embed/score/summarize) is skipped and the response has
+  `details.cacheHit = true` and costs nothing. **Two lightweight steps still run on a cache hit**
+  so a re‑uploaded identical file isn't lost: (1) the attachment is **registered in
+  `ai_audit_state`** with its `contentHash` (keeps the org audit complete *and* feeds the
+  duplicate‑detection index), and (2) if a same‑tenant copy already has vectors in Weaviate, its
+  chunk vectors are **cloned** under the new `attachmentId` — **zero OpenAI tokens** — so the
+  duplicate also gets a centroid and joins semantic search. (Similar/duplicate files are not part
+  of the analyze response — they are served live from
+  [`GET /v1/integrity/similar/{attachmentId}`](#92-get-v1integritysimilarattachmentid--live-similarduplicate-files),
+  which now detects cache‑hit duplicates via the content‑hash index. See [§9.2](#92-get-v1integritysimilarattachmentid--live-similarduplicate-files).)
 
 - **Timeout + graceful fallback.** Since `/analyze` is **async**, the pipeline (steps 4–11) runs in
   the background inside `asyncio.wait_for(..., timeout=analyze_timeout_s)` (set by `ANALYZE_TIMEOUT_S`,
@@ -619,17 +626,30 @@ they can't appear).
 | `attachmentId` | path | string | ✅ | The document to find neighbours for. |
 | `tenantKey` | query | string | ✅ | Tenant scope (`"sub_"+ownerUserId`). Blank → **HTTP 400**. |
 
-**How it works (two tiers, results merged & de‑duplicated):**
+**Resolving the queried file's `contentHash`** uses a fallback chain so it works even for
+cache‑hit files that have no Weaviate chunks: the per‑attachment cache row →
+`ai_audit_state` index (`aggregate.get_content_hash`) → any stored Weaviate chunk.
 
-1. **Exact duplicates** — looks up this attachment's `contentHash` (from the cache, else from any
-   stored chunk) and finds other attachments in the same tenant sharing that hash. These come back
-   with `similarity = 1.0` and `exactDuplicate = true`.
+**How it works (two tiers, each under an independent error guard so one failing never suppresses
+the others; results merged & de‑duplicated):**
+
+1. **Exact duplicates** — the **union of two sources**, so this fires even when a copy was a cache
+   hit (and therefore has no chunks in Weaviate):
+   - **(a) Weaviate** — other attachments in the tenant whose stored chunks share this `contentHash`.
+   - **(b) MongoDB content‑hash index** — `aggregate.find_by_content_hash` scans the tenant's
+     `ai_audit_state.documents` map for entries with the same `contentHash`. Because every analyze
+     (**including cache hits**) registers the attachment with its hash, a re‑uploaded identical file
+     is found here even with zero Weaviate chunks.
+   Both yield `similarity = 1.0`, `exactDuplicate = true`.
 2. **Semantic near‑duplicates** — computes the document's centroid and runs a vault‑wide
    `near_vector` search (across all the tenant's plans), filtered to the current `modelVersion`.
    Matches below `SIMILAR_MIN_SIMILARITY` (default `0.55`) are dropped; an attachment already found
-   as an exact duplicate is not repeated.
+   as an exact duplicate is not repeated. (Cache‑hit files participate here too when their vectors
+   were cloned — see [§6](#6-end-to-end-request-flow-the-12-step-pipeline).)
 
 Results are sorted by `similarity` descending and capped at `SIMILAR_MAX_RESULTS` (default `5`).
+Deleting an attachment (`DELETE /v1/integrity/attachments`) removes it from **both** Weaviate and
+the `ai_audit_state` index, so duplicates of a deleted file stop being reported.
 
 #### Response body: `SimilarFilesResponse`
 
@@ -927,19 +947,26 @@ diagnostics but must never write them.
   _id:        <tenantKey>,                 # "sub_" + ownerUserId
   documents: {                             # the source of truth — one entry per attachment
     "<attachmentId>": {
-      category:  "coop" | "bcp" | "compliance",
-      status:    "Compliant" | "Under Review" | "Non-Compliant",
-      score:     <int 0-100>,
-      fileName:  <string>,
-      planId:    <string>,
-      summary:   <string ≤600 chars>,      # excerpt only; full summary lives in ai_analysis_cache
-      updatedAt: <datetime UTC>
+      category:    "coop" | "bcp" | "compliance",
+      status:      "Compliant" | "Under Review" | "Non-Compliant",
+      score:       <int 0-100>,
+      fileName:    <string>,
+      planId:      <string>,
+      summary:     <string ≤600 chars>,    # excerpt only; full summary lives in ai_analysis_cache
+      contentHash: <string>,               # SHA-256 of file bytes — see "doubles as the dup index"
+      updatedAt:   <datetime UTC>
     },
     ...
   },
   updatedAt:  <datetime UTC>
 }
 ```
+
+> **This map doubles as the tenant‑scoped duplicate‑detection index.** Each entry stores the file's
+> `contentHash`, and an entry is written on **every** analyze — **including cache hits** (where the
+> file never reaches Weaviate). `aggregate.find_by_content_hash` scans it to find exact duplicates
+> for `GET /v1/integrity/similar`, which is how a re‑uploaded identical file (a cache hit) is still
+> detected. `aggregate.get_content_hash` reads one entry's hash. Both are independent of Weaviate.
 
 All audit aggregates the summary endpoint needs — `counts {coop,bcp,compliance,response}`,
 `integrity {compliant,underReview,nonCompliant,unanalyzed}`, `scoreSum`, `scoreCount`,
@@ -1169,7 +1196,7 @@ Every Python module under `app/`, its role, and key functions. (Who/what/why per
 ### `app/api/` — HTTP routes
 | File | Role |
 |------|------|
-| [app/api/integrity.py](../app/api/integrity.py) | `POST /v1/integrity/analyze` (queues the 12‑step pipeline, 202), `GET /v1/integrity/result/{id}` (poll), `GET /v1/integrity/similar/{id}` (live two‑tier duplicate search), `DELETE /v1/integrity/attachments` (purge cache+audit+jobs+vectors). The background pipeline orchestrates fetch→extract→chunk→embed→upsert→score→judge→summarize→persist with a timeout + graceful degraded fallback. |
+| [app/api/integrity.py](../app/api/integrity.py) | `POST /v1/integrity/analyze` (queues the 12‑step pipeline, 202), `GET /v1/integrity/result/{id}` (poll), `GET /v1/integrity/similar/{id}` (live two‑tier duplicate search — Weaviate ∪ Mongo content‑hash index), `DELETE /v1/integrity/attachments` (purge cache+audit+jobs+vectors). The background pipeline orchestrates fetch→extract→chunk→embed→upsert→score→judge→summarize→persist with a timeout + graceful degraded fallback. On a **cache hit** it still registers the attachment in `ai_audit_state` and `_clone_vectors_on_cache_hit` (zero‑token vector clone from a same‑tenant copy) so duplicates are detectable. |
 | [app/api/audit.py](../app/api/audit.py) | `POST /v1/audit/summary` — reads rolling state, builds bounded narrative, marks state clean. |
 | [app/api/health.py](../app/api/health.py) | `/healthz`, `/readyz` (live dep probes), `/metrics` (in‑process counters + `record_request`), `/v1/diagnostics/calls` (auth‑gated call‑log reader). |
 
@@ -1211,7 +1238,7 @@ Every Python module under `app/`, its role, and key functions. (Who/what/why per
 |------|------|
 | [app/store/models.py](../app/store/models.py) | Request‑path Mongo client + collection accessors (`get_cache_col`/`get_state_col`/`get_log_col`/`get_jobs_col`) and `ensure_indexes()`. Collection name constants for all four `ai_*` collections. |
 | [app/store/cache.py](../app/store/cache.py) | `get()` (by content hash), `get_by_attachment()` (fallback for `/result`), and `put()` for `ai_analysis_cache` (the dedup cache). |
-| [app/store/aggregate.py](../app/store/aggregate.py) | `update()` (idempotent `$set documents.<attachmentId>` with a ≤600‑char summary excerpt — replaces, never double‑counts), `remove()` (`$unset` an attachment on delete), `read()` (derives `counts`/`integrity`/`scoreSum`/`scoreCount`/`all_analyzed`/`notable` from the `documents` map, with a legacy‑doc compat path) for `ai_audit_state`. |
+| [app/store/aggregate.py](../app/store/aggregate.py) | `update()` (idempotent `$set documents.<attachmentId>` with a ≤600‑char summary excerpt **and the file's `contentHash`** — replaces, never double‑counts), `remove()` (`$unset` an attachment on delete), `read()` (derives `counts`/`integrity`/`scoreSum`/`scoreCount`/`all_analyzed`/`notable` from the `documents` map, with a legacy‑doc compat path), plus the duplicate‑index helpers `get_content_hash()` and `find_by_content_hash()` for `ai_audit_state`. |
 | [app/store/jobs.py](../app/store/jobs.py) | `ai_analysis_jobs` lifecycle for the async flow: `start()`/`complete()`/`fail()`/`get()`/`remove()` and `reap_stale()` (startup sweep of wedged `processing` jobs → `error`). |
 | [app/store/calllog.py](../app/store/calllog.py) | `append()` — one row per OpenAI call into `ai_call_log` (never raises; logs a WARNING on sink failure). |
 | [app/store/mongo.py](../app/store/mongo.py) | Separate connection for **offline** prep/seed scripts; accessors for the Next.js‑owned `continuityplans` / `continuityauditreports`. Never imported by request‑path routes. |

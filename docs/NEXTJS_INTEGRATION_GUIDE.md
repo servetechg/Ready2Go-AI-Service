@@ -223,7 +223,10 @@ returns stale/deleted files**.
 **Two tiers (merged & de-duplicated, sorted by similarity desc, capped at `SIMILAR_MAX_RESULTS` = 5):**
 
 1. **Exact duplicates** — other attachments in the tenant sharing this file's `contentHash`. Returned
-   with `similarity = 1.0`, `exactDuplicate = true`.
+   with `similarity = 1.0`, `exactDuplicate = true`. **This includes re-uploaded identical files that
+   were a cache hit** (zero-token re-analysis): the service maintains a tenant-scoped content-hash
+   index, so byte-for-byte duplicates are detected in both directions even though the re-upload was
+   never re-embedded. This is the most reliable signal — surface it prominently.
 2. **Semantic near-duplicates** — vault-wide vector search on the document's centroid, filtered to
    the current `modelVersion`; matches below `SIMILAR_MIN_SIMILARITY` (= 0.55) are dropped.
 

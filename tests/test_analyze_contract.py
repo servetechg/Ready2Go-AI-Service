@@ -448,6 +448,126 @@ AUDIT_PAYLOAD = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 8. Duplicate detection survives a cache hit (the gap this change closes).
+#    A re-uploaded identical file is a cache hit → no Weaviate chunks for the new
+#    id → it MUST still surface via the Mongo content-hash index in /similar.
+# ---------------------------------------------------------------------------
+
+def _payload_for(attachment_id: str) -> dict:
+    """ANALYZE_PAYLOAD with a different attachmentId (same fileUrl → same bytes/hash)."""
+    p = json.loads(json.dumps(ANALYZE_PAYLOAD))
+    p["attachment"]["attachmentId"] = attachment_id
+    return p
+
+
+class TestCacheHitDuplicateDetection:
+    @respx.mock
+    def test_cache_hit_duplicate_surfaces_via_mongo_index(self, mock_mongo):
+        """Upload A (miss) then identical B (cache hit); /similar must cross-link them.
+
+        Weaviate exact-dup + semantic tiers are stubbed empty, so detection here can ONLY
+        come from the Mongo content-hash index populated on the cache hit — exactly the
+        path that was previously missing.
+        """
+        respx.get("https://example.com/bcp_document.pdf").mock(
+            return_value=Response(
+                200, content=b"%PDF fake", headers={"Content-Type": "application/pdf"}
+            )
+        )
+        respx.post("https://api.openai.com/v1/embeddings").mock(side_effect=_embed_side_effect)
+
+        headers = _auth_headers()
+        tenant = ANALYZE_PAYLOAD["tenantContext"]["tenantKey"]
+
+        with (
+            patch("app.store.models.ensure_indexes"),
+            patch("app.vectors.client.ensure_collections"),
+            patch("app.api.integrity.get_parser", return_value=_FakeParser()),
+            patch("app.vectors.repo.upsert_chunks", return_value=["uuid-1"]),
+            patch("app.vectors.repo.get_all_chunks", return_value=[]),
+            patch("app.vectors.repo.sibling_similarities", return_value=[]),
+            # The two exact-dup Weaviate helpers used by /similar and the clone — kept empty
+            # so any cross-link must come from the Mongo index, not Weaviate.
+            patch("app.vectors.repo.find_exact_duplicates", return_value=[]),
+            patch("app.vectors.repo.get_attachment_content_hash", return_value=None),
+        ):
+            from app.main import create_app
+            with TestClient(create_app(), raise_server_exceptions=False) as client:
+                # A — full pipeline (cache miss); registers A in the index with its contentHash.
+                env_a = _analyze_and_wait(client, payload=_payload_for("att_A"), headers=headers)
+                assert env_a["state"] == "done"
+                assert env_a["result"]["details"]["cacheHit"] is False
+
+                # B — identical bytes → cache hit; must register B in the index too.
+                env_b = _analyze_and_wait(client, payload=_payload_for("att_B"), headers=headers)
+                assert env_b["state"] == "done"
+                assert env_b["result"]["details"]["cacheHit"] is True
+
+                # /similar/B → finds A as an exact duplicate (similarity 1.0), via Mongo index.
+                rb = client.get(
+                    "/v1/integrity/similar/att_B", params={"tenantKey": tenant}, headers=headers
+                )
+                assert rb.status_code == 200, rb.text
+                sim_b = rb.json()["similar"]
+                assert any(
+                    e["attachmentId"] == "att_A"
+                    and e["exactDuplicate"] is True
+                    and e["similarity"] == 1.0
+                    for e in sim_b
+                ), sim_b
+
+                # /similar/A → finds B too (both directions).
+                ra = client.get(
+                    "/v1/integrity/similar/att_A", params={"tenantKey": tenant}, headers=headers
+                )
+                assert ra.status_code == 200, ra.text
+                assert any(e["attachmentId"] == "att_B" for e in ra.json()["similar"]), ra.json()
+
+    @respx.mock
+    def test_other_tenant_identical_file_not_returned(self, mock_mongo):
+        """Tenant isolation — another tenant's identical file never appears."""
+        respx.get("https://example.com/bcp_document.pdf").mock(
+            return_value=Response(
+                200, content=b"%PDF fake", headers={"Content-Type": "application/pdf"}
+            )
+        )
+        respx.post("https://api.openai.com/v1/embeddings").mock(side_effect=_embed_side_effect)
+
+        headers = _auth_headers()
+
+        with (
+            patch("app.store.models.ensure_indexes"),
+            patch("app.vectors.client.ensure_collections"),
+            patch("app.api.integrity.get_parser", return_value=_FakeParser()),
+            patch("app.vectors.repo.upsert_chunks", return_value=["uuid-1"]),
+            patch("app.vectors.repo.get_all_chunks", return_value=[]),
+            patch("app.vectors.repo.sibling_similarities", return_value=[]),
+            patch("app.vectors.repo.find_exact_duplicates", return_value=[]),
+            patch("app.vectors.repo.get_attachment_content_hash", return_value=None),
+        ):
+            from app.main import create_app
+            with TestClient(create_app(), raise_server_exceptions=False) as client:
+                # Tenant 1 uploads the file.
+                p1 = _payload_for("att_T1")
+                p1["tenantContext"]["tenantKey"] = "sub_tenant1"
+                assert _analyze_and_wait(client, payload=p1, headers=headers)["state"] == "done"
+
+                # Tenant 2 uploads the identical file (cache hit on shared content cache).
+                p2 = _payload_for("att_T2")
+                p2["tenantContext"]["tenantKey"] = "sub_tenant2"
+                assert _analyze_and_wait(client, payload=p2, headers=headers)["state"] == "done"
+
+                # Tenant 2's /similar must NOT see tenant 1's file.
+                r = client.get(
+                    "/v1/integrity/similar/att_T2",
+                    params={"tenantKey": "sub_tenant2"},
+                    headers=headers,
+                )
+                assert r.status_code == 200, r.text
+                assert r.json()["similar"] == []
+
+
 class TestAuditGraceful:
     def test_mongo_read_failure_returns_graceful_fallback(self, app_client):
         with patch(

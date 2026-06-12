@@ -5,7 +5,7 @@ ai_audit_state document shape (one per tenantKey, _id = tenantKey):
     _id:        tenantKey,
     documents:  {                          # one entry per attachment (the source of truth)
       <attachmentId>: {
-        category, status, score, fileName, planId, summary, updatedAt
+        category, status, score, fileName, planId, summary, contentHash, updatedAt
       },
       ...
     },
@@ -59,11 +59,17 @@ def update(
     file_name: str,
     plan_id: str,
     summary: str = "",
+    content_hash: str = "",
 ) -> None:
     """Idempotently record one attachment's latest verdict for *tenant_key*.
 
     `$set documents.<attachmentId>` REPLACES any prior entry for the same attachment,
     so re-analysing never double-counts. No `$inc`/`$push` — aggregates are derived on read.
+
+    *content_hash* (SHA-256 of the file bytes) makes this map double as the authoritative,
+    tenant-scoped `contentHash -> attachmentIds` index used by the `/similar` exact-duplicate
+    tier — which is why this is now written on EVERY analyze, INCLUDING cache hits (where no
+    Weaviate chunk exists for the new attachment to carry the hash). See `find_by_content_hash`.
     """
     summary_excerpt = (summary or "").strip()[:_AUDIT_SUMMARY_CHARS]
     now = datetime.now(UTC)
@@ -72,13 +78,14 @@ def update(
         {
             "$set": {
                 f"documents.{attachment_id}": {
-                    "category":   category,
-                    "status":     status,
-                    "score":      score,
-                    "fileName":   file_name,
-                    "planId":     plan_id,
-                    "summary":    summary_excerpt,
-                    "updatedAt":  now,
+                    "category":    category,
+                    "status":      status,
+                    "score":       score,
+                    "fileName":    file_name,
+                    "planId":      plan_id,
+                    "summary":     summary_excerpt,
+                    "contentHash": content_hash,
+                    "updatedAt":   now,
                 },
                 "updatedAt": now,
             },
@@ -86,6 +93,58 @@ def update(
         },
         upsert=True,
     )
+
+
+def get_content_hash(tenant_key: str, attachment_id: str) -> str | None:
+    """Return the stored contentHash for one attachment, or None if unknown.
+
+    Used by `/similar` to resolve the queried attachment's hash without a Weaviate read —
+    crucial for cache-hit files, which have no Weaviate chunks but DO have an audit entry.
+    """
+    doc = get_state_col().find_one(
+        {"_id": tenant_key},
+        {f"documents.{attachment_id}.contentHash": 1},
+    )
+    if not doc:
+        return None
+    entry = (doc.get("documents") or {}).get(attachment_id) or {}
+    return entry.get("contentHash") or None
+
+
+def find_by_content_hash(
+    tenant_key: str,
+    content_hash: str,
+    *,
+    exclude_attachment_id: str,
+) -> list[dict[str, str]]:
+    """Other attachments in *tenant_key* whose stored contentHash matches → exact duplicates.
+
+    Scans the tenant's per-attachment `documents` map (one Mongo doc). This is the index that
+    survives cache hits: a re-uploaded identical file is registered here even though it never
+    reaches Weaviate. Returns `[{attachmentId, fileName, planId}]`, excluding the queried id.
+    """
+    if not content_hash:
+        return []
+    doc = get_state_col().find_one(
+        {"_id": tenant_key},
+        {"documents": 1},
+    )
+    documents = (doc or {}).get("documents")
+    if not isinstance(documents, dict):
+        return []
+
+    matches: list[dict[str, str]] = []
+    for att_id, entry in documents.items():
+        if att_id == exclude_attachment_id:
+            continue
+        if not isinstance(entry, dict) or entry.get("contentHash") != content_hash:
+            continue
+        matches.append({
+            "attachmentId": att_id,
+            "fileName":     entry.get("fileName", ""),
+            "planId":       entry.get("planId", ""),
+        })
+    return matches
 
 
 def remove(tenant_key: str, attachment_id: str) -> None:
